@@ -28,12 +28,16 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      
       - name: Diagnose Gradle
         run: |
-          pwd
-          ls -la
-          find . -maxdepth 4 -type f
-          gradle projects
+          echo "=== App build file ==="
+          cat app/build.gradle.kts
+          echo "=== Root build file ==="
+          cat build.gradle.kts
+          echo "=== App tasks ==="
+          gradle :app:tasks --all
+
 
       - name: Build debug APK
         run: gradle :app:assembleDebug
