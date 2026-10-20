@@ -381,39 +381,64 @@ class CaptureOverlayService : Service() {
         }
     }
 
-    private fun calibrationRow(
-        label: String,
-        key: String
-    ): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+    
+private fun calibrationRow(
+    label: String,
+    key: String
+): LinearLayout {
+    val row = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(0, 2, 0, 2)
+    }
 
-            val name = TextView(this@CaptureOverlayService).apply {
-                text = label
-                textSize = 12f
-                setTextColor(Color.WHITE)
-                gravity = Gravity.CENTER_VERTICAL
+    val name = TextView(this).apply {
+        text = label
+        textSize = 13f
+        setTextColor(Color.WHITE)
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(4, 0, 4, 0)
+    }
+
+    fun makeButton(
+        caption: String,
+        adjustment: Float
+    ): Button {
+        return Button(this).apply {
+            text = caption
+            textSize = 18f
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(0, 0, 0, 0)
+
+            setOnClickListener {
+                adjustRegion(key, adjustment)
             }
-
-            val minus = Button(this@CaptureOverlayService).apply {
-                text = "−"
-                setOnClickListener {
-                    adjustRegion(key, -0.02f)
-                }
-            }
-
-            val plus = Button(this@CaptureOverlayService).apply {
-                text = "+"
-                setOnClickListener {
-                    adjustRegion(key, 0.02f)
-                }
-            }
-
-            addView(name, LinearLayout.LayoutParams(0, 44, 1f))
-            addView(minus, LinearLayout.LayoutParams(52, 44))
-            addView(plus, LinearLayout.LayoutParams(52, 44))
         }
     }
+
+    val minus = makeButton("−", -0.02f)
+    val plus = makeButton("+", 0.02f)
+
+    row.addView(
+        name,
+        LinearLayout.LayoutParams(0, 48, 1f)
+    )
+
+    row.addView(
+        minus,
+        LinearLayout.LayoutParams(64, 48)
+    )
+
+    row.addView(
+        plus,
+        LinearLayout.LayoutParams(64, 48)
+    )
+
+    return row
+}
 
     private fun analyzeFrame(image: Image): String {
         val bitmap = imageToSmallBitmap(image)
@@ -804,7 +829,7 @@ class CaptureOverlayService : Service() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(12, 8, 12, 8)
+            setPadding(8, 6, 8, 6)
             setBackgroundColor(Color.rgb(20, 25, 33))
         }
 
