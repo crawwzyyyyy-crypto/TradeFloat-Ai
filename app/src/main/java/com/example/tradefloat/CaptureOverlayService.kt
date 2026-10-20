@@ -59,6 +59,9 @@ class CaptureOverlayService : Service() {
     @Volatile private var processing = false
     @Volatile private var stopping = false
 
+    // Short in-memory history of recent frame-level chart centroids.
+    private val recentCentroids = ArrayDeque<Double>()
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -196,59 +199,78 @@ class CaptureOverlayService : Service() {
         try {
             val width = bitmap.width
             val height = bitmap.height
-            // Approximate chart plot area; excludes left sentiment bar and right price labels.
-            val left = (width * 0.07f).toInt().coerceIn(0, width - 1)
-            val right = (width * 0.68f).toInt().coerceIn(left + 1, width)
-            val top = (height * 0.13f).toInt().coerceIn(0, height - 1)
-            val bottom = (height * 0.66f).toInt().coerceIn(top + 1, height)
+            // Approximate chart plot area for the portrait layout in the supplied image.
+            // The price scale and lower trade controls are excluded.
+            val left = (width * 0.025f).toInt().coerceIn(0, width - 1)
+            val right = (width * 0.72f).toInt().coerceIn(left + 1, width)
+            val top = (height * 0.24f).toInt().coerceIn(0, height - 1)
+            val bottom = (height * 0.79f).toInt().coerceIn(top + 1, height)
             val plotHeight = bottom - top
-
-            var earlySum = 0.0
-            var earlyCount = 0
-            var lateSum = 0.0
-            var lateCount = 0
-            var coloredCount = 0
-            var sampledCount = 0
             val plotWidth = right - left
-            val earlyLimit = left + plotWidth / 3
-            val lateLimit = right - plotWidth / 3
+            if (plotHeight < 25 || plotWidth < 25) return "LIVE • chart area too small"
 
-            var y = top
-            while (y < bottom) {
-                var x = left
-                while (x < right) {
-                    sampledCount++
-                    val color = bitmap.getPixel(x, y)
-                    if (isCandleColor(color)) {
-                        coloredCount++
-                        if (x <= earlyLimit) {
-                            earlySum += y.toDouble()
-                            earlyCount++
-                        }
-                        if (x >= lateLimit) {
-                            lateSum += y.toDouble()
-                            lateCount++
-                        }
+            val columns = mutableListOf<Pair<Int, Double>>()
+            var coloredPixels = 0
+            var sampledPixels = 0
+            var x = left
+            while (x < right) {
+                var sumY = 0.0
+                var count = 0
+                var y = top
+                while (y < bottom) {
+                    sampledPixels++
+                    if (isCandleColor(bitmap.getPixel(x, y))) {
+                        coloredPixels++
+                        sumY += y.toDouble()
+                        count++
                     }
-                    x += 2
+                    y += 2
                 }
-                y += 2
+                if (count >= 2) columns.add(x to (sumY / count))
+                x += 2
+            }
+            if (columns.size < 8) {
+                recentCentroids.clear()
+                return "LIVE • chart not recognized\nKeep chart visible; ROI may need calibration."
             }
 
-            if (coloredCount < 12 || earlyCount < 3 || lateCount < 3) {
-                return "LIVE • chart not recognized\nKeep the candles visible; detector needs calibration."
+            val firstX = columns.first().first
+            val lastX = columns.last().first
+            val span = (lastX - firstX).coerceAtLeast(1)
+            val early = columns.filter { it.first <= firstX + span / 3 }.map { it.second }
+            val late = columns.filter { it.first >= lastX - span / 3 }.map { it.second }
+            if (early.size < 2 || late.size < 2)
+                return "LIVE • collecting chart samples\nKeep chart visible for a few seconds."
+
+            val spatialDelta = late.average() - early.average()
+            val spatialTrend = when {
+                spatialDelta < -plotHeight * 0.035 -> "UP"
+                spatialDelta > plotHeight * 0.035 -> "DOWN"
+                else -> "FLAT"
             }
 
-            val earlyY = earlySum / earlyCount
-            val lateY = lateSum / lateCount
-            val delta = lateY - earlyY
-            val trend = when {
-                delta < -plotHeight * 0.025 -> "UP"
-                delta > plotHeight * 0.025 -> "DOWN"
+            val frameCentroid = columns.map { it.second }.average()
+            recentCentroids.addLast(frameCentroid)
+            while (recentCentroids.size > 6) recentCentroids.removeFirst()
+            val temporalTrend = if (recentCentroids.size >= 4) {
+                val old = recentCentroids.elementAt(recentCentroids.size - 4)
+                val delta = frameCentroid - old
+                when {
+                    delta < -plotHeight * 0.008 -> "UP"
+                    delta > plotHeight * 0.008 -> "DOWN"
+                    else -> "FLAT"
+                }
+            } else "WARMING UP"
+
+            val state = when {
+                temporalTrend == "WARMING UP" -> "UNCLEAR"
+                spatialTrend == temporalTrend && spatialTrend != "FLAT" -> spatialTrend
+                spatialTrend == "FLAT" && temporalTrend != "FLAT" -> temporalTrend
+                spatialTrend != "FLAT" && temporalTrend == "FLAT" -> spatialTrend
                 else -> "UNCLEAR"
             }
-            val coverage = (coloredCount * 100 / sampledCount.coerceAtLeast(1)).coerceIn(0, 100)
-            return "LIVE VISUAL SLOPE: $trend\nSample coverage: $coverage%\nFrames update automatically\nIn-memory only • not a future-price prediction"
+            val coverage = coloredPixels * 100 / sampledPixels.coerceAtLeast(1)
+            return "LIVE VISUAL: $state\nSpatial slope: $spatialTrend • frame movement: $temporalTrend\nColored-pixel coverage: $coverage%\nFrames update automatically\nVisual estimate only • not a trade prediction"
         } finally {
             bitmap.recycle()
         }
@@ -344,9 +366,9 @@ class CaptureOverlayService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 18
-            y = 120
+            gravity = Gravity.BOTTOM or Gravity.START
+            x = 12
+            y = 210
         }
 
         header.setOnTouchListener(object : View.OnTouchListener {
