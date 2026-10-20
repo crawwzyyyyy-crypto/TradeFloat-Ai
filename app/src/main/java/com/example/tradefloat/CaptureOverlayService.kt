@@ -85,12 +85,10 @@ class CaptureOverlayService : Service() {
         try {
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = manager.getMediaProjection(resultCode, data)
-            if (Settings.canDrawOverlays(this)) showOverlay()
             setupCapture()
-        } catch (e: Exception) {
-            statusText?.post {
-                statusText?.text = "Capture failed: ${e.javaClass.simpleName}\\nStop and restart screen sharing."
-            }
+            if (Settings.canDrawOverlays(this)) showOverlay()
+        } catch (_: Exception) {
+            stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -119,15 +117,14 @@ class CaptureOverlayService : Service() {
                 }
             }
         }, null)
-        // Android 14+ requires callback registration before createVirtualDisplay().
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopSelf() }
-        }, null)
         virtualDisplay = projection?.createVirtualDisplay(
             "TradeFloatLive", w, h, dm.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, null
         )
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }
+        }, null)
     }
 
     // Heuristic: detect saturated colored pixels in a rough central ROI and compare
@@ -136,47 +133,62 @@ class CaptureOverlayService : Service() {
     private fun analyzeFrame(image: Image): String {
         val bmp = toBitmap(image) ?: return "LIVE • frame unavailable"
         try {
-            val left = (bmp.width * 0.06f).toInt()
-            val right = (bmp.width * 0.86f).toInt()
-            val top = (bmp.height * 0.16f).toInt()
-            val bottom = (bmp.height * 0.78f).toInt()
+            // Approximate the actual plot region. The price axis and sentiment bar
+            // are excluded; chart position can vary by device/layout.
+            val left = (bmp.width * 0.07f).toInt()
+            val right = (bmp.width * 0.68f).toInt()
+            val top = (bmp.height * 0.13f).toInt()
+            val bottom = (bmp.height * 0.66f).toInt()
             val pw = right - left
             val ph = bottom - top
-            if (pw < 40 || ph < 40) return "LIVE • chart area too small"
+            if (pw < 40 || ph < 40) return "LIVE • screen area too small"
 
-            val bands = 8
-            val centers = DoubleArray(bands) { Double.NaN }
-            for (b in 0 until bands) {
-                val x0 = left + pw * b / bands
-                val x1 = left + pw * (b + 1) / bands
+            // For each horizontal sample column, calculate the centroid of
+            // saturated red/green candle-like pixels. Skip empty columns, then
+            // compare the older and newer parts of the detected chart.
+            val samples = mutableListOf<Pair<Int, Double>>()
+            var x = left
+            while (x < right) {
                 var sumY = 0.0
                 var count = 0
                 var y = top
                 while (y < bottom) {
-                    var x = x0
-                    while (x < x1) {
-                        if (isMarketColor(bmp.getPixel(x, y))) {
-                            sumY += y
-                            count++
-                        }
-                        x += 3
+                    if (isMarketColor(bmp.getPixel(x, y))) {
+                        sumY += y.toDouble()
+                        count++
                     }
-                    y += 3
+                    y += 2
                 }
-                if (count >= 3) centers[b] = sumY / count
+                // Require enough colored pixels to avoid treating one stray pixel
+                // as a candle column.
+                if (count >= 2) samples.add(x to (sumY / count))
+                x += 2
             }
-            val early = (0..3).map { centers[it] }.filter { it.isFinite() }
-            val late = (5..7).map { centers[it] }.filter { it.isFinite() }
-            if (early.size < 2 || late.size < 2)
-                return "LIVE • chart not recognized\nTry a clearer chart view; ROI needs calibration."
-            val delta = late.average() - early.average()
-            val threshold = ph * 0.025
-            val trend = when {
-                delta < -threshold -> "VISUAL TREND: UP"
-                delta > threshold -> "VISUAL TREND: DOWN"
-                else -> "VISUAL TREND: UNCLEAR"
+
+            if (samples.size < 12) {
+                return "LIVE • chart not recognized\nKeep candles visible; this detector needs ROI calibration."
             }
-            return "$trend\nLive frame sampling ~2x/sec\nIn-memory only • no saved screenshots\nThis is NOT a future-price prediction"
+
+            val firstX = samples.first().first
+            val lastX = samples.last().first
+            val span = (lastX - firstX).coerceAtLeast(1)
+            val older = samples.filter { it.first <= firstX + span / 3 }.map { it.second }
+            val newer = samples.filter { it.first >= lastX - span / 3 }.map { it.second }
+            if (older.size < 3 || newer.size < 3) {
+                return "LIVE • not enough candle samples\nTry zooming out one step."
+            }
+
+            val oldY = older.average()
+            val newY = newer.average()
+            val delta = newY - oldY // Android screen Y increases downward.
+            val threshold = ph * 0.035
+            val result = when {
+                delta < -threshold -> "VISUAL SLOPE: UP"
+                delta > threshold -> "VISUAL SLOPE: DOWN"
+                else -> "VISUAL SLOPE: UNCLEAR"
+            }
+            val coverage = (samples.size * 100 / (pw / 2).coerceAtLeast(1)).coerceIn(0, 100)
+            return "$result\nChart pixels detected: $coverage%\nLive frame sampling • in-memory only\nNot a future-price prediction"
         } finally {
             bmp.recycle()
         }
