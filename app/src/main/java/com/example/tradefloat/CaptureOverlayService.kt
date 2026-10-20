@@ -353,7 +353,7 @@ class CaptureOverlayService : Service() {
             val recent = distinct.takeLast(min(8, distinct.size))
             val recentDelta = recent.last().centerY - recent.first().centerY
             val broad = classifyDelta(broadDelta, plotH)
-            val recentSlope = classifyDelta(recentDelta, plotH * 0.60)
+            val recentSlope = classifyDelta(recentDelta, (plotH * 0.60).toInt())
 
             synchronized(trendHistory) {
                 trendHistory.addLast(recentSlope)
