@@ -1,7 +1,7 @@
-
 package com.example.tradefloat
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -11,118 +11,98 @@ import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
-import android.graphics.Color
 
 class MainActivity : Activity() {
-
-    private val captureRequest = 4102
+    private val captureRequest = 501
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        val layout = LinearLayout(this).apply {
+        val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(28, 28, 28, 28)
-            setBackgroundColor(Color.rgb(15, 18, 24))
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(24, 28, 24, 28)
+            setBackgroundColor(0xFF101318.toInt())
         }
-
-        val info = TextView(this).apply {
-            text = "TRADEFLOAT\n\nFloating chart assistant\n\nThis starter tests Android screen capture and the floating panel. AI predictions are not implemented yet."
-            textSize = 18f
-            setTextColor(Color.WHITE)
+        root.addView(TextView(this).apply {
+            text = "TRADEFLOAT"
+            textSize = 28f
+            setTextColor(0xFFFFFFFF.toInt())
             gravity = Gravity.CENTER
-            setPadding(0, 20, 0, 24)
-        }
-
-        val overlay = Button(this).apply {
-            text = "1. Allow floating panel"
+        })
+        root.addView(TextView(this).apply {
+            text = "Visible-chart analysis • manual assistance\n\n" +
+                "Screen pixels are not verified market prices. " +
+                "This app does not place trades and cannot guarantee outcomes. " +
+                "Use demo mode first."
+            textSize = 16f
+            setTextColor(0xFFD4D8E0.toInt())
+            setPadding(0, 18, 0, 20)
+        })
+        root.addView(Button(this).apply {
+            text = "Enable floating panel permission"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    startActivity(
-                        Intent(
-                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            Uri.parse("package:$packageName")
-                        )
-                    )
-                } else {
-                    info.text = "Overlay permission enabled. Start the screen session."
+                    startActivity(Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    ))
                 }
             }
-        }
-
-        val start = Button(this).apply {
-            text = "2. Start screen session"
+        })
+        root.addView(Button(this).apply {
+            text = "Start live screen session"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    info.text = "Enable Display over other apps first."
+                    startActivity(Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    ))
                 } else {
-                    val manager =
-                        getSystemService(MEDIA_PROJECTION_SERVICE)
-                            as MediaProjectionManager
-
-                    startActivityForResult(
-                        manager.createScreenCaptureIntent(),
-                        captureRequest
-                    )
+                    val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    startActivityForResult(manager.createScreenCaptureIntent(), captureRequest)
                 }
             }
-        }
-
-        val stop = Button(this).apply {
-            text = "Stop floating panel"
+        })
+        root.addView(Button(this).apply {
+            text = "Stop live session"
             setOnClickListener {
-                stopService(
-                    Intent(
-                        this@MainActivity,
-                        CaptureOverlayService::class.java
-                    )
-                )
+                stopService(Intent(this@MainActivity, CaptureOverlayService::class.java))
             }
+        })
+        root.addView(TextView(this).apply {
+            text = "ROADMAP\n\n" +
+                "1 Floating panel: implemented\n" +
+                "2 Live frame sampling: implemented\n" +
+                "3 Chart-region calibration: implemented\n" +
+                "4 Candle-like visual candidates: heuristic only\n" +
+                "5 Image-proxy indicators: unverified, not market indicators\n" +
+                "6 Conservative combined assessment: implemented\n" +
+                "7 Expiry horizon tracking: implemented, not a forecast\n" +
+                "8 Manual outcome validation: implemented\n\n" +
+                "No automatic trading."
+            textSize = 14f
+            setTextColor(0xFFB7C0CE.toInt())
+            setPadding(0, 22, 0, 12)
+        })
+        setContentView(ScrollView(this).apply { addView(root) })
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 700)
         }
-
-        layout.addView(info)
-        layout.addView(overlay)
-        layout.addView(start)
-        layout.addView(stop)
-
-        setContentView(layout)
     }
 
-    @Deprecated("Legacy activity result API for starter compatibility")
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: Intent?
-    ) {
+    @Deprecated("Activity result compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode == captureRequest &&
-            resultCode == RESULT_OK &&
-            data != null
-        ) {
-            val serviceIntent = Intent(
-                this,
-                CaptureOverlayService::class.java
-            ).apply {
-                putExtra(
-                    CaptureOverlayService.EXTRA_RESULT_CODE,
-                    resultCode
-                )
-                putExtra(
-                    CaptureOverlayService.EXTRA_RESULT_DATA,
-                    data
-                )
+        if (requestCode == captureRequest && resultCode == RESULT_OK && data != null) {
+            val serviceIntent = Intent(this, CaptureOverlayService::class.java).apply {
+                putExtra(CaptureOverlayService.EXTRA_RESULT_CODE, resultCode)
+                putExtra(CaptureOverlayService.EXTRA_RESULT_DATA, data)
             }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-
-            finish()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
+            else startService(serviceIntent)
         }
     }
 }
