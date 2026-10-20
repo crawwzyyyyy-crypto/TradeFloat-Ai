@@ -26,13 +26,13 @@ import android.os.IBinder
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -46,18 +46,33 @@ class CaptureOverlayService : Service() {
         private const val CHANNEL = "tradefloat_capture"
         private const val NOTIFICATION_ID = 17
 
-        // Fixed 30-second analysis horizon.
-        // Change to 60 for a one-minute horizon.
-        private const val HORIZON_SECONDS = 30
-
-        // Approximate chart region, expressed as screen fractions.
+        // Initial chart region. These are screen fractions, not
+        // guaranteed chart coordinates for every trading platform.
         private const val ROI_LEFT = 0.05f
         private const val ROI_RIGHT = 0.70f
         private const val ROI_TOP = 0.20f
         private const val ROI_BOTTOM = 0.68f
 
-        private const val FRAME_INTERVAL_MS = 900L
+        private const val FRAME_INTERVAL_MS = 700L
     }
+
+    @Volatile
+    private var horizonSeconds = 30
+
+    @Volatile
+    private var processing = false
+
+    @Volatile
+    private var stopped = false
+
+    @Volatile
+    private var lastFrameAt = 0L
+
+    @Volatile
+    private var lastDirection = "UNCLEAR"
+
+    @Volatile
+    private var lastConfidence = "WAITING FOR CHART"
 
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -69,28 +84,18 @@ class CaptureOverlayService : Service() {
 
     private var windowManager: WindowManager? = null
     private var panel: View? = null
+    private var headerText: TextView? = null
     private var directionText: TextView? = null
     private var detailText: TextView? = null
 
-    @Volatile
-    private var processing = false
-
-    @Volatile
-    private var stopped = false
-
-    @Volatile
-    private var lastFrameAt = 0L
-
-    private val trendHistory = ArrayDeque<String>()
-
-    private data class Run(
+    private data class ColorRun(
         val x: Int,
         val top: Int,
         val bottom: Int,
         val color: Int
     )
 
-    private data class Candle(
+    private data class CandleCandidate(
         val x: Int,
         val left: Int,
         val right: Int,
@@ -105,7 +110,7 @@ class CaptureOverlayService : Service() {
             get() = bottom - top + 1
     }
 
-    private data class Analysis(
+    private data class VisualResult(
         val direction: String,
         val confidence: String,
         val details: String
@@ -177,12 +182,11 @@ class CaptureOverlayService : Service() {
             startWorker()
             setupCapture()
 
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             showOverlayIfAllowed()
-
             showMessage(
                 "UNCLEAR",
-                "Screen capture could not start. Check permissions and restart."
+                "Screen capture failed.\nCheck permissions and restart."
             )
         }
 
@@ -193,7 +197,7 @@ class CaptureOverlayService : Service() {
         if (workerThread != null) return
 
         workerThread = HandlerThread(
-            "TradeFloatChartReader"
+            "TradeFloatLiveChart"
         ).also {
             it.start()
             workerHandler = Handler(it.looper)
@@ -204,7 +208,7 @@ class CaptureOverlayService : Service() {
         return if (Build.VERSION.SDK_INT >= 26) {
             Notification.Builder(this, CHANNEL)
                 .setContentTitle("TradeFloat is running")
-                .setContentText("Reading the visible chart")
+                .setContentText("Reading visible chart frames")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build()
@@ -212,7 +216,7 @@ class CaptureOverlayService : Service() {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
                 .setContentTitle("TradeFloat is running")
-                .setContentText("Reading the visible chart")
+                .setContentText("Reading visible chart frames")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build()
@@ -255,15 +259,21 @@ class CaptureOverlayService : Service() {
                     val accepted = workerHandler?.post {
                         try {
                             val result = analyzeFrame(image)
+
+                            lastDirection = result.direction
+                            lastConfidence = result.confidence
+
                             showMessage(
                                 result.direction,
                                 result.details
                             )
                         } catch (_: Exception) {
-                            resetHistory()
+                            lastDirection = "UNCLEAR"
+                            lastConfidence = "ANALYSIS ERROR"
+
                             showMessage(
                                 "UNCLEAR",
-                                "Chart could not be analyzed reliably."
+                                "Chart analysis failed.\nWaiting for a readable frame."
                             )
                         } finally {
                             try {
@@ -303,6 +313,7 @@ class CaptureOverlayService : Service() {
         }
 
         projectionCallback = callback
+
         activeProjection.registerCallback(
             callback,
             workerHandler
@@ -318,16 +329,26 @@ class CaptureOverlayService : Service() {
             null,
             workerHandler
         ) ?: throw IllegalStateException(
-            "Could not create the screen display."
+            "Could not create screen display."
         )
 
         showMessage(
             "UNCLEAR",
-            "Reading visible chart… waiting for sufficient samples."
+            "Continuously reading the visible chart…"
         )
     }
 
-    private fun analyzeFrame(image: Image): Analysis {
+    /*
+     * Visual-only analysis:
+     * 1. Detect red/green vertical runs.
+     * 2. Group nearby runs into candle-like candidates.
+     * 3. Compare broad and recent vertical movement.
+     * 4. Require recent color evidence to agree with both.
+     *
+     * The output is not verified market OHLC or a calibrated
+     * probability of a future move.
+     */
+    private fun analyzeFrame(image: Image): VisualResult {
         val bitmap = imageToSmallBitmap(image)
             ?: return unclear("Chart frame unavailable.")
 
@@ -335,14 +356,18 @@ class CaptureOverlayService : Service() {
             val width = bitmap.width
             val height = bitmap.height
 
+            if (width < 50 || height < 50) {
+                return unclear("Screen frame is too small.")
+            }
+
             val left = (width * ROI_LEFT)
-                .toInt().coerceIn(0, width - 1)
+                .toInt().coerceIn(0, width - 2)
 
             val right = (width * ROI_RIGHT)
                 .toInt().coerceIn(left + 1, width)
 
             val top = (height * ROI_TOP)
-                .toInt().coerceIn(0, height - 1)
+                .toInt().coerceIn(0, height - 2)
 
             val bottom = (height * ROI_BOTTOM)
                 .toInt().coerceIn(top + 1, height)
@@ -351,27 +376,27 @@ class CaptureOverlayService : Service() {
             val plotHeight = bottom - top
 
             if (plotWidth < 40 || plotHeight < 40) {
-                return unclear("Visible chart region is too small.")
+                return unclear("Chart region is too small.")
             }
 
-            val runs = mutableListOf<Run>()
+            val runs = mutableListOf<ColorRun>()
             var coloredPixels = 0
             var sampledPixels = 0
 
+            // Scan multiple vertical columns through the ROI.
             var x = left
 
-            // Sample vertical color runs across the visible chart.
             while (x < right) {
                 var y = top
-                var runStart = -1
-                var runEnd = -1
+                var start = -1
+                var end = -1
                 var redVotes = 0
                 var greenVotes = 0
 
                 fun finishRun() {
                     if (
-                        runStart >= 0 &&
-                        runEnd - runStart + 1 >= 3
+                        start >= 0 &&
+                        end - start + 1 >= 3
                     ) {
                         val color = when {
                             greenVotes > redVotes -> Color.GREEN
@@ -381,18 +406,18 @@ class CaptureOverlayService : Service() {
 
                         if (color != Color.TRANSPARENT) {
                             runs.add(
-                                Run(
-                                    x,
-                                    runStart,
-                                    runEnd,
-                                    color
+                                ColorRun(
+                                    x = x,
+                                    top = start,
+                                    bottom = end,
+                                    color = color
                                 )
                             )
                         }
                     }
 
-                    runStart = -1
-                    runEnd = -1
+                    start = -1
+                    end = -1
                     redVotes = 0
                     greenVotes = 0
                 }
@@ -404,8 +429,8 @@ class CaptureOverlayService : Service() {
                     if (isCandleColor(pixel)) {
                         coloredPixels++
 
-                        if (runStart < 0) runStart = y
-                        runEnd = y
+                        if (start < 0) start = y
+                        end = y
 
                         val red = Color.red(pixel)
                         val green = Color.green(pixel)
@@ -435,148 +460,156 @@ class CaptureOverlayService : Service() {
                 x += 2
             }
 
-            val coverage = (
-                coloredPixels * 100 /
-                    sampledPixels.coerceAtLeast(1)
-                ).coerceIn(0, 100)
+            val coverage = coloredPixels * 100 /
+                sampledPixels.coerceAtLeast(1)
 
             val filteredRuns = runs.filter {
                 val runHeight = it.bottom - it.top + 1
+
                 runHeight >= 3 &&
                     runHeight <= plotHeight * 0.22
             }
 
-            val candidates = groupRuns(
+            val grouped = groupRuns(
                 filteredRuns,
                 plotHeight
             )
 
-            // Avoid treating nearby fragments as separate candles.
-            val distinct = mutableListOf<Candle>()
+            // Merge close fragments instead of counting every
+            // fragment as an independent candle.
+            val candidates = mutableListOf<CandleCandidate>()
 
-            for (candidate in candidates) {
-                val previous = distinct.lastOrNull()
+            for (candidate in grouped) {
+                val previous = candidates.lastOrNull()
 
                 if (
                     previous == null ||
                     candidate.x - previous.x >= 4
                 ) {
-                    distinct.add(candidate)
+                    candidates.add(candidate)
                 } else if (candidate.height > previous.height) {
-                    distinct[distinct.lastIndex] = candidate
+                    candidates[candidates.lastIndex] = candidate
                 }
             }
 
-            if (distinct.size < 10 || coverage < 1) {
-                resetHistory()
-
+            if (candidates.size < 10 || coverage < 1) {
                 return unclear(
-                    "Insufficient chart detail. Keep more candles visible."
+                    "Insufficient visible candle detail.\n" +
+                        "Keep more chart candles visible."
                 )
             }
 
             val span = (
-                distinct.last().x - distinct.first().x
-                ).coerceAtLeast(1)
+                candidates.last().x - candidates.first().x
+            ).coerceAtLeast(1)
 
-            val firstX = distinct.first().x
+            val firstX = candidates.first().x
 
-            val older = distinct.filter {
+            val older = candidates.filter {
                 it.x <= firstX + span / 3
             }
 
-            val newer = distinct.filter {
-                it.x >= distinct.last().x - span / 3
+            val newer = candidates.filter {
+                it.x >= candidates.last().x - span / 3
             }
 
             if (older.size < 3 || newer.size < 3) {
-                resetHistory()
-
                 return unclear(
-                    "Waiting for enough separated chart samples."
+                    "Waiting for enough separated visual groups."
                 )
             }
 
-            // Screen Y increases downward, so a negative delta
-            // represents a visually rising pattern.
+            // Screen Y grows downwards: smaller Y means visually higher.
             val broadDelta =
                 newer.map { it.centerY }.average() -
                     older.map { it.centerY }.average()
 
-            val recent = distinct.takeLast(
-                min(8, distinct.size)
+            val recent = candidates.takeLast(
+                min(8, candidates.size)
             )
 
             val recentDelta =
                 recent.last().centerY -
                     recent.first().centerY
 
-            val broad = classifyDelta(broadDelta, plotHeight)
+            val broadDirection = classifyDelta(
+                broadDelta,
+                plotHeight
+            )
+
             val recentDirection = classifyDelta(
                 recentDelta,
                 (plotHeight * 0.60).toInt().coerceAtLeast(1)
             )
 
-            val consistency: Int
+            // Color evidence from the rightmost candidates.
+            val recentCandles = candidates.takeLast(
+                min(6, candidates.size)
+            )
 
-            synchronized(trendHistory) {
-                trendHistory.addLast(recentDirection)
-
-                while (trendHistory.size > 5) {
-                    trendHistory.removeFirst()
-                }
-
-                consistency = trendHistory.count {
-                    it == recentDirection
-                }
+            val greenCount = recentCandles.count {
+                it.color == Color.GREEN
             }
 
-            val agreement = when {
-                broad == "UNCLEAR" ||
-                    recentDirection == "UNCLEAR" -> "UNCLEAR"
+            val redCount = recentCandles.count {
+                it.color == Color.RED
+            }
 
-                broad != recentDirection -> "UNCLEAR"
+            val colorDirection = when {
+                greenCount >= 4 && greenCount > redCount -> "UP"
+                redCount >= 4 && redCount > greenCount -> "DOWN"
+                else -> "UNCLEAR"
+            }
 
-                consistency < 4 -> "UNCLEAR"
+            val direction = when {
+                broadDirection == "UP" &&
+                    recentDirection == "UP" &&
+                    colorDirection == "UP" -> "UP"
 
-                else -> recentDirection
+                broadDirection == "DOWN" &&
+                    recentDirection == "DOWN" &&
+                    colorDirection == "DOWN" -> "DOWN"
+
+                else -> "UNCLEAR"
             }
 
             val confidence = when {
-                distinct.size >= 15 &&
-                    coverage >= 1 &&
-                    consistency >= 4 &&
-                    broad == recentDirection &&
-                    agreement != "UNCLEAR" ->
-                    "REPEATED VISUAL PATTERN"
+                direction == "UNCLEAR" ->
+                    "SIGNALS DISAGREE OR ARE WEAK"
+
+                candidates.size >= 15 &&
+                    coverage >= 1 ->
+                    "VISUAL SIGNALS ALIGNED"
 
                 else ->
-                    "LOW VISUAL CONFIDENCE"
+                    "LIMITED VISUAL EVIDENCE"
             }
 
-            // Conservative display: no direction unless the
-            // basic visual checks agree. This is not a forecast.
-            val direction = if (
-                confidence == "REPEATED VISUAL PATTERN"
+            // No probability is invented from pixel consistency.
+            val safeDirection = if (
+                confidence == "VISUAL SIGNALS ALIGNED"
             ) {
-                agreement
+                direction
             } else {
                 "UNCLEAR"
             }
 
-            val detail = buildString {
-                append("Horizon: ${HORIZON_SECONDS}s")
-                append(" • ${distinct.size} visual groups\n")
-                append("Confidence: $confidence\n")
-                append("Broad/recent: $broad / $recentDirection\n")
-                append("Visual consistency: $consistency/5\n")
-                append("Not verified price data or a forecast.")
+            val details = buildString {
+                append("Horizon: ${horizonSeconds}s\n")
+                append("Visual groups: ${candidates.size}\n")
+                append("Visual assessment: $confidence\n")
+                append(
+                    "Broad / recent: " +
+                        "$broadDirection / $recentDirection\n"
+                )
+                append("Recent color evidence: $colorDirection\n")
+                append("Screen-only estimate • not a forecast")
             }
 
-            return Analysis(
-                direction = direction,
+            return VisualResult(
+                direction = safeDirection,
                 confidence = confidence,
-                details = detail
+                details = details
             )
         } finally {
             bitmap.recycle()
@@ -584,14 +617,14 @@ class CaptureOverlayService : Service() {
     }
 
     private fun groupRuns(
-        runs: List<Run>,
+        runs: List<ColorRun>,
         plotHeight: Int
-    ): List<Candle> {
-        val output = mutableListOf<Candle>()
+    ): List<CandleCandidate> {
+        val output = mutableListOf<CandleCandidate>()
 
         for (
             run in runs.sortedWith(
-                compareBy<Run> { it.x }.thenBy { it.top }
+                compareBy<ColorRun> { it.x }.thenBy { it.top }
             )
         ) {
             val previous = output.lastOrNull()
@@ -622,7 +655,7 @@ class CaptureOverlayService : Service() {
                 val newTop = min(previous.top, run.top)
                 val newBottom = max(previous.bottom, run.bottom)
 
-                output[output.lastIndex] = Candle(
+                output[output.lastIndex] = CandleCandidate(
                     x = (newLeft + newRight) / 2,
                     left = newLeft,
                     right = newRight,
@@ -632,7 +665,7 @@ class CaptureOverlayService : Service() {
                 )
             } else {
                 output.add(
-                    Candle(
+                    CandleCandidate(
                         x = run.x,
                         left = run.x,
                         right = run.x,
@@ -675,9 +708,11 @@ class CaptureOverlayService : Service() {
         if (high < 100 || high - low < 50) return false
 
         return (
-            red > green * 1.22 && red > blue * 1.12
+            red > green * 1.22 &&
+                red > blue * 1.12
         ) || (
-            green > red * 1.10 && green > blue * 1.05
+            green > red * 1.10 &&
+                green > blue * 1.05
         )
     }
 
@@ -697,7 +732,7 @@ class CaptureOverlayService : Service() {
         val rowPadding = (
             (rowStride - pixelStride * width) /
                 pixelStride
-            ).coerceAtLeast(0)
+        ).coerceAtLeast(0)
 
         val paddedWidth = width + rowPadding
 
@@ -746,9 +781,7 @@ class CaptureOverlayService : Service() {
     }
 
     private fun showOverlayIfAllowed() {
-        if (Settings.canDrawOverlays(this)) {
-            showOverlay()
-        }
+        if (Settings.canDrawOverlays(this)) showOverlay()
     }
 
     private fun showOverlay() {
@@ -761,33 +794,51 @@ class CaptureOverlayService : Service() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(14, 12, 14, 12)
+            setPadding(12, 10, 12, 10)
             setBackgroundColor(Color.rgb(20, 25, 33))
         }
 
-        val header = TextView(this).apply {
-            text = "TRADEFLOAT • LIVE"
-            textSize = 18f
+        headerText = TextView(this).apply {
+            text = "TRADEFLOAT • LIVE • 30s"
+            textSize = 17f
             setTextColor(Color.WHITE)
             setPadding(2, 2, 2, 6)
+
+            // Tap the title to switch between 30 seconds and 1 minute.
+            // The three-button UI remains unchanged.
+            setOnClickListener {
+                horizonSeconds =
+                    if (horizonSeconds == 30) 60 else 30
+
+                text = "TRADEFLOAT • LIVE • " +
+                    if (horizonSeconds == 30) "30s" else "1m"
+
+                showMessage(
+                    "UNCLEAR",
+                    "Horizon changed.\nWaiting for a fresh chart reading."
+                )
+            }
         }
 
         directionText = TextView(this).apply {
             text = "UNCLEAR"
-            textSize = 26f
-            setTypeface(null, android.graphics.Typeface.BOLD)
+            textSize = 28f
+            setTypeface(
+                null,
+                android.graphics.Typeface.BOLD
+            )
             setTextColor(Color.LTGRAY)
-            setPadding(2, 5, 2, 5)
+            setPadding(2, 4, 2, 4)
         }
 
         detailText = TextView(this).apply {
-            text = "Waiting for visible chart data…"
+            text = "Reading visible chart…"
             textSize = 12f
             setTextColor(Color.LTGRAY)
-            setPadding(2, 2, 2, 10)
+            setPadding(2, 2, 2, 8)
         }
 
-        fun createButton(
+        fun makeButton(
             label: String,
             color: Int,
             action: () -> Unit
@@ -797,6 +848,7 @@ class CaptureOverlayService : Service() {
                 textSize = 16f
                 isAllCaps = false
                 setTextColor(Color.WHITE)
+
                 backgroundTintList =
                     ColorStateList.valueOf(color)
 
@@ -804,50 +856,50 @@ class CaptureOverlayService : Service() {
 
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
-                    48
+                    46
                 ).apply {
-                    bottomMargin = 5
+                    bottomMargin = 4
                 }
             }
         }
 
-        val upButton = createButton(
+        val upButton = makeButton(
             "UP ↑",
-            Color.rgb(30, 170, 100)
+            Color.rgb(30, 180, 105)
         ) {
             Toast.makeText(
                 this,
-                "Manual UP selection. No trade was placed.",
+                "Manual UP selection only. No trade was placed.",
                 Toast.LENGTH_SHORT
             ).show()
         }
 
-        val downButton = createButton(
+        val downButton = makeButton(
             "DOWN ↓",
-            Color.rgb(235, 65, 90)
+            Color.rgb(240, 65, 90)
         ) {
             Toast.makeText(
                 this,
-                "Manual DOWN selection. No trade was placed.",
+                "Manual DOWN selection only. No trade was placed.",
                 Toast.LENGTH_SHORT
             ).show()
         }
 
-        val stopButton = createButton(
+        val stopButton = makeButton(
             "STOP",
-            Color.rgb(75, 82, 94)
+            Color.rgb(70, 77, 88)
         ) {
             stopSelf()
         }
 
-        root.addView(header)
+        root.addView(headerText)
         root.addView(directionText)
         root.addView(detailText)
         root.addView(upButton)
         root.addView(downButton)
         root.addView(stopButton)
 
-        val windowType =
+        val type =
             if (Build.VERSION.SDK_INT >= 26) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             } else {
@@ -856,41 +908,97 @@ class CaptureOverlayService : Service() {
             }
 
         val params = WindowManager.LayoutParams(
-            (resources.displayMetrics.widthPixels * 0.82f)
+            (resources.displayMetrics.widthPixels * 0.78f)
                 .toInt().coerceAtLeast(1),
             WindowManager.LayoutParams.WRAP_CONTENT,
-            windowType,
+            type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            // Keep the panel below the chart region as much as possible.
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = 220
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = (resources.displayMetrics.heightPixels * 0.25f)
+                .toInt()
         }
+
+        // Drag the panel by its title without adding more controls.
+        headerText?.setOnTouchListener(
+            object : View.OnTouchListener {
+                private var startX = 0
+                private var startY = 0
+                private var touchX = 0f
+                private var touchY = 0f
+                private var moved = false
+
+                override fun onTouch(
+                    view: View,
+                    event: MotionEvent
+                ): Boolean {
+                    when (event.action) {
+                        MotionEvent.ACTION_DOWN -> {
+                            startX = params.x
+                            startY = params.y
+                            touchX = event.rawX
+                            touchY = event.rawY
+                            moved = false
+                            return true
+                        }
+
+                        MotionEvent.ACTION_MOVE -> {
+                            val dx = event.rawX - touchX
+                            val dy = event.rawY - touchY
+
+                            if (abs(dx) > 6 || abs(dy) > 6) {
+                                moved = true
+                            }
+
+                            if (moved) {
+                                params.x = startX + dx.toInt()
+                                params.y = startY + dy.toInt()
+
+                                try {
+                                    windowManager?.updateViewLayout(
+                                        root,
+                                        params
+                                    )
+                                } catch (_: Exception) {
+                                }
+                            }
+                            return true
+                        }
+
+                        MotionEvent.ACTION_UP -> {
+                            if (!moved) {
+                                headerText?.performClick()
+                            }
+                            return true
+                        }
+                    }
+
+                    return true
+                }
+            }
+        )
 
         try {
             windowManager?.addView(root, params)
             panel = root
         } catch (_: Exception) {
+            headerText = null
             directionText = null
             detailText = null
             panel = null
         }
     }
 
-    private fun unclear(message: String): Analysis {
-        return Analysis(
+    private fun unclear(message: String): VisualResult {
+        return VisualResult(
             direction = "UNCLEAR",
             confidence = "INSUFFICIENT VISUAL EVIDENCE",
-            details = "Horizon: ${HORIZON_SECONDS}s\n$message\nNo verified price forecast."
+            details = "Horizon: ${horizonSeconds}s\n" +
+                "$message\n" +
+                "Screen-only estimate • not a forecast"
         )
-    }
-
-    private fun resetHistory() {
-        synchronized(trendHistory) {
-            trendHistory.clear()
-        }
     }
 
     private fun showMessage(
@@ -975,6 +1083,7 @@ class CaptureOverlayService : Service() {
         }
 
         panel = null
+        headerText = null
         directionText = null
         detailText = null
 
