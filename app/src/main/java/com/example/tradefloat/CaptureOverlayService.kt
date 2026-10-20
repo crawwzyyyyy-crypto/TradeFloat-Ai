@@ -17,7 +17,6 @@ import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
-import android.hardware.display.VirtualDisplay as AndroidVirtualDisplay
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
@@ -44,6 +43,7 @@ class CaptureOverlayService : Service() {
 
         private const val CHANNEL = "tradefloat_capture"
         private const val NOTIFICATION_ID = 17
+        private const val PREFS = "tradefloat_roi"
     }
 
     private var projection: MediaProjection? = null
@@ -53,6 +53,7 @@ class CaptureOverlayService : Service() {
     private var windowManager: WindowManager? = null
     private var panel: View? = null
     private var statusText: TextView? = null
+    private var regionText: TextView? = null
 
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
@@ -63,6 +64,18 @@ class CaptureOverlayService : Service() {
 
     @Volatile
     private var stopped = false
+
+    @Volatile
+    private var roiLeft = 0.055f
+
+    @Volatile
+    private var roiRight = 0.70f
+
+    @Volatile
+    private var roiTop = 0.14f
+
+    @Volatile
+    private var roiBottom = 0.68f
 
     private var lastFrameAt = 0L
 
@@ -140,6 +153,8 @@ class CaptureOverlayService : Service() {
         }
 
         try {
+            loadCalibration()
+
             val manager =
                 getSystemService(Context.MEDIA_PROJECTION_SERVICE)
                     as MediaProjectionManager
@@ -243,7 +258,10 @@ class CaptureOverlayService : Service() {
                                     e.javaClass.simpleName
                             )
                         } finally {
-                            image.close()
+                            try {
+                                image.close()
+                            } catch (_: Exception) {
+                            }
                             processing = false
                         }
                     } ?: false
@@ -288,8 +306,113 @@ class CaptureOverlayService : Service() {
 
         setStatus(
             "LIVE • collecting chart frames…\n" +
-                "Keep the chart visible."
+                "Adjust the chart region if necessary."
         )
+    }
+
+    private fun loadCalibration() {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        roiLeft = prefs.getFloat("left", 0.055f)
+        roiRight = prefs.getFloat("right", 0.70f)
+        roiTop = prefs.getFloat("top", 0.14f)
+        roiBottom = prefs.getFloat("bottom", 0.68f)
+
+        validateRegion()
+    }
+
+    private fun saveCalibration() {
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putFloat("left", roiLeft)
+            .putFloat("right", roiRight)
+            .putFloat("top", roiTop)
+            .putFloat("bottom", roiBottom)
+            .apply()
+    }
+
+    private fun validateRegion() {
+        roiLeft = roiLeft.coerceIn(0f, 0.60f)
+        roiRight = roiRight.coerceIn(0.30f, 1f)
+        roiTop = roiTop.coerceIn(0f, 0.70f)
+        roiBottom = roiBottom.coerceIn(0.30f, 1f)
+
+        if (roiRight - roiLeft < 0.10f) {
+            roiRight = (roiLeft + 0.10f).coerceAtMost(1f)
+            roiLeft = (roiRight - 0.10f).coerceAtLeast(0f)
+        }
+
+        if (roiBottom - roiTop < 0.10f) {
+            roiBottom = (roiTop + 0.10f).coerceAtMost(1f)
+            roiTop = (roiBottom - 0.10f).coerceAtLeast(0f)
+        }
+    }
+
+    private fun adjustRegion(key: String, amount: Float) {
+        when (key) {
+            "left" -> roiLeft += amount
+            "right" -> roiRight += amount
+            "top" -> roiTop += amount
+            "bottom" -> roiBottom += amount
+        }
+
+        validateRegion()
+        saveCalibration()
+        updateRegionLabel()
+
+        // Discard previous trend readings after changing the region.
+        synchronized(trendHistory) {
+            trendHistory.clear()
+        }
+
+        setStatus(
+            "CHART REGION UPDATED\n" +
+                "Allow new frames to be analyzed."
+        )
+    }
+
+    private fun updateRegionLabel() {
+        regionText?.post {
+            regionText?.text =
+                "L ${(roiLeft * 100).toInt()}%  " +
+                "R ${(roiRight * 100).toInt()}%  " +
+                "T ${(roiTop * 100).toInt()}%  " +
+                "B ${(roiBottom * 100).toInt()}%"
+        }
+    }
+
+    private fun calibrationRow(
+        label: String,
+        key: String
+    ): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+
+            val name = TextView(this@CaptureOverlayService).apply {
+                text = label
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            val minus = Button(this@CaptureOverlayService).apply {
+                text = "−"
+                setOnClickListener {
+                    adjustRegion(key, -0.02f)
+                }
+            }
+
+            val plus = Button(this@CaptureOverlayService).apply {
+                text = "+"
+                setOnClickListener {
+                    adjustRegion(key, 0.02f)
+                }
+            }
+
+            addView(name, LinearLayout.LayoutParams(0, 44, 1f))
+            addView(minus, LinearLayout.LayoutParams(52, 44))
+            addView(plus, LinearLayout.LayoutParams(52, 44))
+        }
     }
 
     private fun analyzeFrame(image: Image): String {
@@ -300,14 +423,16 @@ class CaptureOverlayService : Service() {
             val width = bitmap.width
             val height = bitmap.height
 
-            // Approximate chart region for this portrait layout.
-            val left = (width * 0.055f)
+            val left = (width * roiLeft)
                 .toInt().coerceIn(0, width - 1)
-            val right = (width * 0.70f)
+
+            val right = (width * roiRight)
                 .toInt().coerceIn(left + 1, width)
-            val top = (height * 0.14f)
+
+            val top = (height * roiTop)
                 .toInt().coerceIn(0, height - 1)
-            val bottom = (height * 0.68f)
+
+            val bottom = (height * roiBottom)
                 .toInt().coerceIn(top + 1, height)
 
             val plotWidth = right - left
@@ -330,24 +455,13 @@ class CaptureOverlayService : Service() {
                 var runGreen = 0
 
                 fun finishRun() {
-                    if (
-                        runStart >= 0 &&
-                        runEnd - runStart >= 2
-                    ) {
+                    if (runStart >= 0 && runEnd - runStart >= 2) {
                         val color =
-                            if (runGreen > runRed) {
-                                Color.GREEN
-                            } else {
-                                Color.RED
-                            }
+                            if (runGreen > runRed) Color.GREEN
+                            else Color.RED
 
                         runs.add(
-                            CandleRun(
-                                x = x,
-                                top = runStart,
-                                bottom = runEnd,
-                                color = color
-                            )
+                            CandleRun(x, runStart, runEnd, color)
                         )
                     }
 
@@ -400,18 +514,18 @@ class CaptureOverlayService : Service() {
             )
 
             if (candidates.size < 6) {
-                trendHistory.clear()
+                synchronized(trendHistory) {
+                    trendHistory.clear()
+                }
 
                 return "LIVE • insufficient candidates\n" +
                     "Candidates: ${candidates.size}\n" +
                     "Coverage: $coverage%\n" +
-                    "Keep more candles visible."
+                    "Adjust chart region if needed."
             }
 
-            // Overall slope from the complete visible set.
             val broadSlope = calculateSlope(candidates)
 
-            // Recent slope from the latest 35% of candidates.
             val recentStart = (candidates.size * 0.65)
                 .toInt()
                 .coerceAtMost(candidates.lastIndex)
@@ -433,14 +547,18 @@ class CaptureOverlayService : Service() {
                 0.012
             )
 
-            trendHistory.addLast(recentTrend)
+            val consistency: Int
 
-            while (trendHistory.size > 5) {
-                trendHistory.removeFirst()
-            }
+            synchronized(trendHistory) {
+                trendHistory.addLast(recentTrend)
 
-            val consistency = trendHistory.count {
-                it == recentTrend
+                while (trendHistory.size > 5) {
+                    trendHistory.removeFirst()
+                }
+
+                consistency = trendHistory.count {
+                    it == recentTrend
+                }
             }
 
             val quality = when {
@@ -475,7 +593,7 @@ class CaptureOverlayService : Service() {
                 "Candidate groups: ${candidates.size}\n" +
                 "Recent consistency: $consistency/5\n" +
                 "Color coverage: $coverage%\n" +
-                "Visual analysis only • not a price prediction"
+                "Visual estimate only • not a price prediction"
 
         } finally {
             bitmap.recycle()
@@ -487,13 +605,8 @@ class CaptureOverlayService : Service() {
     ): Double {
         if (points.size < 2) return 0.0
 
-        val meanX = points.map {
-            it.x.toDouble()
-        }.average()
-
-        val meanY = points.map {
-            it.centerY
-        }.average()
+        val meanX = points.map { it.x.toDouble() }.average()
+        val meanY = points.map { it.centerY }.average()
 
         var numerator = 0.0
         var denominator = 0.0
@@ -691,7 +804,7 @@ class CaptureOverlayService : Service() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(16, 12, 16, 12)
+            setPadding(12, 8, 12, 8)
             setBackgroundColor(Color.rgb(20, 25, 33))
         }
 
@@ -699,14 +812,27 @@ class CaptureOverlayService : Service() {
             text = "TRADEFLOAT  ⋮"
             textSize = 16f
             setTextColor(Color.WHITE)
-            setPadding(4, 2, 4, 8)
+            setPadding(4, 2, 4, 6)
         }
 
         statusText = TextView(this).apply {
             text = "LIVE • starting…"
-            textSize = 13f
+            textSize = 12f
             setTextColor(Color.LTGRAY)
-            setPadding(4, 4, 4, 8)
+            setPadding(4, 4, 4, 6)
+        }
+
+        val calibrationTitle = TextView(this).apply {
+            text = "CHART REGION"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setPadding(4, 6, 4, 2)
+        }
+
+        regionText = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+            setPadding(4, 2, 4, 4)
         }
 
         val stopButton = Button(this).apply {
@@ -716,6 +842,12 @@ class CaptureOverlayService : Service() {
 
         root.addView(header)
         root.addView(statusText)
+        root.addView(calibrationTitle)
+        root.addView(regionText)
+        root.addView(calibrationRow("Left edge", "left"))
+        root.addView(calibrationRow("Right edge", "right"))
+        root.addView(calibrationRow("Top edge", "top"))
+        root.addView(calibrationRow("Bottom edge", "bottom"))
         root.addView(stopButton)
 
         val windowType =
@@ -735,8 +867,8 @@ class CaptureOverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 18
-            y = 120
+            x = 12
+            y = 80
         }
 
         header.setOnTouchListener(
@@ -783,8 +915,10 @@ class CaptureOverlayService : Service() {
         try {
             windowManager?.addView(root, params)
             panel = root
+            updateRegionLabel()
         } catch (_: Exception) {
             statusText = null
+            regionText = null
             panel = null
         }
     }
@@ -848,8 +982,10 @@ class CaptureOverlayService : Service() {
             panel?.let { windowManager?.removeView(it) }
         } catch (_: Exception) {
         }
+
         panel = null
         statusText = null
+        regionText = null
 
         workerThread?.quitSafely()
         workerThread = null
