@@ -1,39 +1,23 @@
-# TradeFloat Android Starter (v0.1.0)
+# TradeFloat Android project
 
-A native Android proof-of-concept for a movable floating panel and explicit user-approved screen capture.
+Visible-chart-only floating analysis prototype. It does not connect to a broker/API, does not place trades, and cannot reliably recover true OHLC data from arbitrary screenshots. Pixel-derived metrics are visual proxies, not verified market indicators or a reliable trading signal.
 
-## What this version does
-- Requests Android's "Display over other apps" permission.
-- Requests screen-capture consent using MediaProjection.
-- Starts a foreground screen-capture service.
-- Displays a movable overlay with a stop button.
-- Builds a debug APK using GitHub Actions.
+## Roadmap
+1. Floating panel and start/stop: included.
+2. MediaProjection screen sampling in memory: included.
+3. Adjustable chart region persisted locally: included.
+4. Colored candle-like candidates: heuristic only, not verified OHLC extraction.
+5. EMA/RSI/MACD-like calculations on pixel coordinates: explicitly labeled image proxies, not market indicators.
+6. Conservative visual combination with UNCLEAR state: included.
+7. Adjustable analysis horizon: tracked separately; not a forecast.
+8. Manual prediction logging and outcome labeling: included; reported matches are not a guarantee of future accuracy.
 
-## What it does NOT do yet
-- It does not identify chart candles or extract price values.
-- It does not calculate RSI/MACD/EMA.
-- It does not use an AI vision model or issue UP/DOWN predictions.
-- It does not place trades or interact with the trading app.
-- It is not validated for real-money trading.
+## Build
+1. Install current Android Studio and its supported JDK.
+2. Open this folder in Android Studio and sync Gradle.
+3. Build > Build APK(s), then install the debug APK.
+4. Open TradeFloat. Grant Display over other apps permission.
+5. Tap Start live screen session and approve Android's screen capture dialog.
+6. Switch to the chart, calibrate the chart region, then use Log estimate and manually label an outcome after the chosen horizon.
 
-## Build from Android using GitHub
-1. Create a new GitHub repository named `TradeFloat`.
-2. Upload all files and folders from this project, preserving the folder structure.
-3. Open the repository's **Actions** tab.
-4. Enable Actions if prompted, then run **Build Android APK** (or push a commit to `main`).
-5. Open the completed workflow run, scroll to **Artifacts**, and download `TradeFloat-debug-apk`.
-6. Extract the ZIP on your Android phone and install `app-debug.apk`. Android may ask you to allow installs from that browser/file manager.
-
-## First run
-1. Open TradeFloat.
-2. Tap **Allow floating panel** and enable "Display over other apps".
-3. Return to TradeFloat.
-4. Tap **Start screen session** and approve Android's screen-capture prompt.
-5. The app closes to let you use another app; the floating panel should appear.
-6. Tap **Stop** on the panel to end the session.
-
-## Safety and privacy
-Screen capture can expose sensitive on-screen information. Start it only when intended, stop it when done, and do not share captured screens containing account details. This starter does not upload screenshots to a server.
-
-## Next development milestone
-Add chart-region selection, candle/price extraction, confidence and "unclear" thresholds, then compare predictions against historical/out-of-sample data before considering any live trading use.
+Android requires fresh screen-capture consent for each session. Test on demo charts first. The app offers manual assistance only; all trading decisions remain yours.
