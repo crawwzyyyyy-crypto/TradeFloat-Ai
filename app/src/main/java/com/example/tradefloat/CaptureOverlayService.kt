@@ -17,6 +17,7 @@ import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
+import android.hardware.display.VirtualDisplay as AndroidVirtualDisplay
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
@@ -32,7 +33,6 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.util.ArrayDeque
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -56,6 +56,7 @@ class CaptureOverlayService : Service() {
 
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
+    private var projectionCallback: MediaProjection.Callback? = null
 
     @Volatile
     private var processing = false
@@ -64,7 +65,6 @@ class CaptureOverlayService : Service() {
     private var stopped = false
 
     private var lastFrameAt = 0L
-    private var projectionCallback: MediaProjection.Callback? = null
 
     private data class CandleRun(
         val x: Int,
@@ -97,9 +97,7 @@ class CaptureOverlayService : Service() {
         flags: Int,
         startId: Int
     ): Int {
-        if (projection != null) {
-            return START_NOT_STICKY
-        }
+        if (projection != null) return START_NOT_STICKY
 
         createNotificationChannel()
 
@@ -115,7 +113,7 @@ class CaptureOverlayService : Service() {
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -160,6 +158,10 @@ class CaptureOverlayService : Service() {
             setupCapture()
 
         } catch (e: Exception) {
+            if (panel == null && Settings.canDrawOverlays(this)) {
+                showOverlay()
+            }
+
             setStatus(
                 "STARTUP ERROR: ${e.javaClass.simpleName}\n" +
                     (e.message ?: "Check permissions and restart.")
@@ -232,11 +234,9 @@ class CaptureOverlayService : Service() {
                     processing = true
                     lastFrameAt = now
 
-                    // Keep expensive image processing off the UI thread.
                     val accepted = workerHandler?.post {
                         try {
-                            val result = analyzeFrame(image)
-                            setStatus(result)
+                            setStatus(analyzeFrame(image))
                         } catch (e: Exception) {
                             setStatus(
                                 "LIVE • analysis error: " +
@@ -264,7 +264,6 @@ class CaptureOverlayService : Service() {
                 "Screen-capture permission is missing."
             )
 
-        // Android requires callback registration before display creation.
         val callback = object : MediaProjection.Callback() {
             override fun onStop() {
                 stopSelf()
@@ -284,23 +283,15 @@ class CaptureOverlayService : Service() {
             null,
             workerHandler
         ) ?: throw IllegalStateException(
-            "Could not create the screen display."
+            "Could not create screen display."
         )
 
         setStatus(
             "LIVE • collecting chart frames…\n" +
-                "Keep the chart visible for a few seconds."
+                "Keep the chart visible."
         )
     }
 
-    /**
-     * Experimental image analysis.
-     *
-     * Finds colored vertical runs, groups nearby compatible runs,
-     * then compares the visual positions of candidates across the plot.
-     *
-     * It does NOT recover verified OHLC prices or forecast future prices.
-     */
     private fun analyzeFrame(image: Image): String {
         val bitmap = imageToSmallBitmap(image)
             ?: return "LIVE • frame unavailable"
@@ -309,17 +300,13 @@ class CaptureOverlayService : Service() {
             val width = bitmap.width
             val height = bitmap.height
 
-            // Approximate chart bounds for the current portrait layout.
-            // These are not user-calibrated coordinates.
+            // Approximate chart region for this portrait layout.
             val left = (width * 0.055f)
                 .toInt().coerceIn(0, width - 1)
-
             val right = (width * 0.70f)
                 .toInt().coerceIn(left + 1, width)
-
             val top = (height * 0.14f)
                 .toInt().coerceIn(0, height - 1)
-
             val bottom = (height * 0.68f)
                 .toInt().coerceIn(top + 1, height)
 
@@ -333,7 +320,6 @@ class CaptureOverlayService : Service() {
             val runs = mutableListOf<CandleRun>()
             var coloredPixels = 0
             var sampledPixels = 0
-
             var x = left
 
             while (x < right) {
@@ -346,10 +332,9 @@ class CaptureOverlayService : Service() {
                 fun finishRun() {
                     if (
                         runStart >= 0 &&
-                        runEnd >= runStart &&
                         runEnd - runStart >= 2
                     ) {
-                        val runColor =
+                        val color =
                             if (runGreen > runRed) {
                                 Color.GREEN
                             } else {
@@ -361,7 +346,7 @@ class CaptureOverlayService : Service() {
                                 x = x,
                                 top = runStart,
                                 bottom = runEnd,
-                                color = runColor
+                                color = color
                             )
                         )
                     }
@@ -379,10 +364,7 @@ class CaptureOverlayService : Service() {
                     if (isCandleColor(color)) {
                         coloredPixels++
 
-                        if (runStart < 0) {
-                            runStart = y
-                        }
-
+                        if (runStart < 0) runStart = y
                         runEnd = y
 
                         val red = Color.red(color)
@@ -406,10 +388,8 @@ class CaptureOverlayService : Service() {
                     sampledPixels.coerceAtLeast(1)
             ).coerceIn(0, 100)
 
-            // Filter extreme runs, which are more likely to be unrelated UI.
             val usableRuns = runs.filter {
                 val runHeight = it.bottom - it.top + 1
-
                 runHeight >= 2 &&
                     runHeight <= plotHeight * 0.35
             }
@@ -422,91 +402,131 @@ class CaptureOverlayService : Service() {
             if (candidates.size < 6) {
                 trendHistory.clear()
 
-                return "LIVE • not enough candle candidates\n" +
+                return "LIVE • insufficient candidates\n" +
                     "Candidates: ${candidates.size}\n" +
-                    "Color coverage: $coverage%\n" +
+                    "Coverage: $coverage%\n" +
                     "Keep more candles visible."
             }
 
-            val firstX = candidates.first().x
-            val lastX = candidates.last().x
-            val span = (lastX - firstX).coerceAtLeast(1)
+            // Overall slope from the complete visible set.
+            val broadSlope = calculateSlope(candidates)
 
-            val older = candidates
-                .filter { it.x <= firstX + span / 3 }
-                .map { it.centerY }
+            // Recent slope from the latest 35% of candidates.
+            val recentStart = (candidates.size * 0.65)
+                .toInt()
+                .coerceAtMost(candidates.lastIndex)
 
-            val newer = candidates
-                .filter { it.x >= lastX - span / 3 }
-                .map { it.centerY }
+            val recentCandidates = candidates.drop(recentStart)
+            val recentSlope = calculateSlope(recentCandidates)
 
-            if (older.size < 2 || newer.size < 2) {
-                return "LIVE • collecting chart structure\n" +
-                    "Candidates: ${candidates.size}\n" +
-                    "Coverage: $coverage%"
-            }
+            val broadTrend = classifySlope(
+                broadSlope,
+                plotHeight,
+                plotWidth,
+                0.020
+            )
 
-            // Smaller screen Y corresponds to a higher position on the chart.
-            val delta = newer.average() - older.average()
+            val recentTrend = classifySlope(
+                recentSlope,
+                plotHeight,
+                plotWidth,
+                0.012
+            )
 
-            val visualSlope = when {
-                delta < -plotHeight * 0.025 -> "UP"
-                delta > plotHeight * 0.025 -> "DOWN"
-                else -> "UNCLEAR"
-            }
+            trendHistory.addLast(recentTrend)
 
-            trendHistory.addLast(visualSlope)
             while (trendHistory.size > 5) {
                 trendHistory.removeFirst()
             }
 
-            val consistentFrames =
-                trendHistory.count { it == visualSlope }
+            val consistency = trendHistory.count {
+                it == recentTrend
+            }
 
-            // Detection quality describes only the visual heuristic.
             val quality = when {
                 candidates.size >= 12 &&
                     coverage >= 1 &&
-                    consistentFrames >= 4 ->
+                    consistency >= 4 ->
                     "VISUAL CANDIDATES CONSISTENT"
 
-                candidates.size >= 6 ->
-                    "LOW VISUAL CONFIDENCE"
-
                 else ->
-                    "INSUFFICIENT DATA"
+                    "LOW VISUAL CONFIDENCE"
             }
 
-            // Never present this visual slope as a future-price prediction.
-            val displayDirection =
-                if (
-                    quality == "VISUAL CANDIDATES CONSISTENT" &&
-                    visualSlope != "UNCLEAR"
-                ) {
-                    visualSlope
-                } else {
+            val direction = when {
+                quality != "VISUAL CANDIDATES CONSISTENT" ->
                     "UNCLEAR"
-                }
 
-            return "LIVE CHART TRACKER: $displayDirection\n" +
+                broadTrend == "UNCLEAR" ||
+                    recentTrend == "UNCLEAR" ->
+                    "UNCLEAR"
+
+                broadTrend != recentTrend ->
+                    "CONFLICT"
+
+                else ->
+                    recentTrend
+            }
+
+            return "LIVE CHART TRACKER: $direction\n" +
                 "$quality\n" +
-                "Candle candidates: ${candidates.size}\n" +
-                "Visual slope: $visualSlope\n" +
-                "Frame consistency: $consistentFrames/5\n" +
+                "Broad chart slope: $broadTrend\n" +
+                "Recent visual slope: $recentTrend\n" +
+                "Candidate groups: ${candidates.size}\n" +
+                "Recent consistency: $consistency/5\n" +
                 "Color coverage: $coverage%\n" +
-                "Frames update automatically\n" +
-                "Visual estimate only • not a trade prediction"
+                "Visual analysis only • not a price prediction"
 
         } finally {
             bitmap.recycle()
         }
     }
 
-    /**
-     * Groups neighboring colored runs when their colors match and their
-     * vertical ranges overlap or are close. This is still a heuristic:
-     * a group is a candle candidate, not a verified candle.
-     */
+    private fun calculateSlope(
+        points: List<CandleCandidate>
+    ): Double {
+        if (points.size < 2) return 0.0
+
+        val meanX = points.map {
+            it.x.toDouble()
+        }.average()
+
+        val meanY = points.map {
+            it.centerY
+        }.average()
+
+        var numerator = 0.0
+        var denominator = 0.0
+
+        for (point in points) {
+            val dx = point.x - meanX
+            numerator += dx * (point.centerY - meanY)
+            denominator += dx * dx
+        }
+
+        return if (denominator == 0.0) {
+            0.0
+        } else {
+            numerator / denominator
+        }
+    }
+
+    private fun classifySlope(
+        slope: Double,
+        plotHeight: Int,
+        plotWidth: Int,
+        fraction: Double
+    ): String {
+        val threshold =
+            plotHeight * fraction / plotWidth.coerceAtLeast(1)
+
+        return when {
+            slope < -threshold -> "UP"
+            slope > threshold -> "DOWN"
+            else -> "UNCLEAR"
+        }
+    }
+
     private fun groupCandleRuns(
         runs: List<CandleRun>,
         plotHeight: Int
@@ -537,9 +557,9 @@ class CaptureOverlayService : Service() {
 
             val canMerge =
                 previous != null &&
-                previous.color == run.color &&
-                run.x - previous.right <= 8 &&
-                verticalGap <= max(4, plotHeight / 70)
+                    previous.color == run.color &&
+                    run.x - previous.right <= 8 &&
+                    verticalGap <= max(4, plotHeight / 70)
 
             if (canMerge && previous != null) {
                 val newLeft = previous.left
@@ -569,14 +589,11 @@ class CaptureOverlayService : Service() {
             }
         }
 
-        // Remove unusually tall groups that likely combine unrelated objects.
-        return groups
-            .filter {
-                it.height >= 3 &&
-                    it.height <= plotHeight * 0.45 &&
-                    it.right - it.left <= 20
-            }
-            .sortedBy { it.x }
+        return groups.filter {
+            it.height >= 3 &&
+                it.height <= plotHeight * 0.45 &&
+                it.right - it.left <= 20
+        }.sortedBy { it.x }
     }
 
     private fun isCandleColor(color: Int): Boolean {
@@ -584,12 +601,10 @@ class CaptureOverlayService : Service() {
         val green = Color.green(color)
         val blue = Color.blue(color)
 
-        val highest = max(red, max(green, blue))
-        val lowest = min(red, min(green, blue))
+        val high = max(red, max(green, blue))
+        val low = min(red, min(green, blue))
 
-        if (highest < 90 || highest - lowest < 45) {
-            return false
-        }
+        if (high < 90 || high - low < 45) return false
 
         val redLike =
             red > green * 1.22 &&
@@ -608,7 +623,6 @@ class CaptureOverlayService : Service() {
         val buffer = plane.buffer
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
-
         val width = image.width
         val height = image.height
 
@@ -662,18 +676,13 @@ class CaptureOverlayService : Service() {
             false
         )
 
-        if (scaled !== cropped) {
-            cropped.recycle()
-        }
+        if (scaled !== cropped) cropped.recycle()
 
         return scaled
     }
 
     private fun showOverlay() {
-        if (
-            panel != null ||
-            !Settings.canDrawOverlays(this)
-        ) {
+        if (panel != null || !Settings.canDrawOverlays(this)) {
             return
         }
 
@@ -702,9 +711,7 @@ class CaptureOverlayService : Service() {
 
         val stopButton = Button(this).apply {
             text = "STOP LIVE SESSION"
-            setOnClickListener {
-                stopSelf()
-            }
+            setOnClickListener { stopSelf() }
         }
 
         root.addView(header)
@@ -760,10 +767,7 @@ class CaptureOverlayService : Service() {
                                 (event.rawY - touchY).toInt()
 
                             try {
-                                windowManager?.updateViewLayout(
-                                    root,
-                                    params
-                                )
+                                windowManager?.updateViewLayout(root, params)
                             } catch (_: Exception) {
                             }
 
