@@ -85,10 +85,12 @@ class CaptureOverlayService : Service() {
         try {
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = manager.getMediaProjection(resultCode, data)
-            setupCapture()
             if (Settings.canDrawOverlays(this)) showOverlay()
-        } catch (_: Exception) {
-            stopSelf()
+            setupCapture()
+        } catch (e: Exception) {
+            statusText?.post {
+                statusText?.text = "Capture failed: ${e.javaClass.simpleName}\\nStop and restart screen sharing."
+            }
         }
         return START_NOT_STICKY
     }
@@ -117,14 +119,15 @@ class CaptureOverlayService : Service() {
                 }
             }
         }, null)
+        // Android 14+ requires callback registration before createVirtualDisplay().
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }
+        }, null)
         virtualDisplay = projection?.createVirtualDisplay(
             "TradeFloatLive", w, h, dm.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, null
         )
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopSelf() }
-        }, null)
     }
 
     // Heuristic: detect saturated colored pixels in a rough central ROI and compare
