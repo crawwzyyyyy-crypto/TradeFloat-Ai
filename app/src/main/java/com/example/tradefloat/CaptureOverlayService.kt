@@ -85,12 +85,10 @@ class CaptureOverlayService : Service() {
         try {
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = manager.getMediaProjection(resultCode, data)
-            if (Settings.canDrawOverlays(this)) showOverlay()
             setupCapture()
-        } catch (e: Exception) {
-            statusText?.post {
-                statusText?.text = "Capture failed: ${e.javaClass.simpleName}\\nStop and restart screen sharing."
-            }
+            if (Settings.canDrawOverlays(this)) showOverlay()
+        } catch (_: Exception) {
+            stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -119,82 +117,171 @@ class CaptureOverlayService : Service() {
                 }
             }
         }, null)
-        // Android 14+ requires callback registration before createVirtualDisplay().
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopSelf() }
-        }, null)
         virtualDisplay = projection?.createVirtualDisplay(
             "TradeFloatLive", w, h, dm.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, null
         )
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }
+        }, null)
     }
 
     // Heuristic: detect saturated colored pixels in a rough central ROI and compare
     // their vertical centroids in earlier vs later horizontal bands.
     // It may detect indicators/buttons instead of candles; calibrate before use.
+    private data class VisualCandle(
+        val x: Int,
+        val top: Int,
+        val bottom: Int,
+        val centerY: Double,
+        val greenPixels: Int,
+        val redPixels: Int
+    )
+    private val frameHistory = ArrayDeque<List<VisualCandle>>()
+    private var previousSummary = "Collecting chart frames…"
+
+    /**
+     * Continuous, in-memory visual candle approximation.
+     * This detects narrow vertical clusters of saturated pixels; it is NOT
+     * a guaranteed OHLC extractor and must be validated against the user's chart.
+     */
     private fun analyzeFrame(image: Image): String {
         val bmp = toBitmap(image) ?: return "LIVE • frame unavailable"
         try {
-            // Approximate the actual plot region. The price axis and sentiment bar
-            // are excluded; chart position can vary by device/layout.
+            // Plot region excludes the left sentiment bar and right-side price labels.
             val left = (bmp.width * 0.07f).toInt()
             val right = (bmp.width * 0.68f).toInt()
             val top = (bmp.height * 0.13f).toInt()
             val bottom = (bmp.height * 0.66f).toInt()
             val pw = right - left
             val ph = bottom - top
-            if (pw < 40 || ph < 40) return "LIVE • screen area too small"
+            if (pw < 40 || ph < 40) return "LIVE • chart region too small"
 
-            // For each horizontal sample column, calculate the centroid of
-            // saturated red/green candle-like pixels. Skip empty columns, then
-            // compare the older and newer parts of the detected chart.
-            val samples = mutableListOf<Pair<Int, Double>>()
+            // Collect saturated red/green pixels by x-column.
+            val columns = mutableListOf<VisualCandle>()
             var x = left
             while (x < right) {
+                var topY = bottom
+                var bottomY = top
                 var sumY = 0.0
                 var count = 0
+                var red = 0
+                var green = 0
                 var y = top
                 while (y < bottom) {
-                    if (isMarketColor(bmp.getPixel(x, y))) {
+                    val c = bmp.getPixel(x, y)
+                    if (isMarketColor(c)) {
+                        topY = min(topY, y)
+                        bottomY = max(bottomY, y)
                         sumY += y.toDouble()
                         count++
+                        if (Color.red(c) > Color.green(c) * 1.2) red++
+                        if (Color.green(c) > Color.red(c) * 1.1) green++
                     }
                     y += 2
                 }
-                // Require enough colored pixels to avoid treating one stray pixel
-                // as a candle column.
-                if (count >= 2) samples.add(x to (sumY / count))
+                // Keep only columns with a few saturated pixels and plausible vertical span.
+                if (count >= 3 && bottomY - topY >= 3) {
+                    columns.add(VisualCandle(x, topY, bottomY, sumY / count, green, red))
+                }
                 x += 2
             }
-
-            if (samples.size < 12) {
-                return "LIVE • chart not recognized\nKeep candles visible; this detector needs ROI calibration."
+            if (columns.size < 10) {
+                return "LIVE • chart not recognized\nKeep candles visible; adjust chart zoom/region."
             }
 
-            val firstX = samples.first().first
-            val lastX = samples.last().first
-            val span = (lastX - firstX).coerceAtLeast(1)
-            val older = samples.filter { it.first <= firstX + span / 3 }.map { it.second }
-            val newer = samples.filter { it.first >= lastX - span / 3 }.map { it.second }
-            if (older.size < 3 || newer.size < 3) {
-                return "LIVE • not enough candle samples\nTry zooming out one step."
+            // Merge adjacent x-columns into approximate visual clusters/candles.
+            val candles = mutableListOf<VisualCandle>()
+            var group = mutableListOf<VisualCandle>()
+            for (col in columns) {
+                if (group.isNotEmpty() && col.x - group.last().x > 8) {
+                    candles.add(mergeColumns(group))
+                    group = mutableListOf()
+                }
+                group.add(col)
+            }
+            if (group.isNotEmpty()) candles.add(mergeColumns(group))
+            if (candles.size < 4) {
+                return "LIVE • candles unclear\nTry zooming chart out slightly."
             }
 
-            val oldY = older.average()
-            val newY = newer.average()
-            val delta = newY - oldY // Android screen Y increases downward.
-            val threshold = ph * 0.035
-            val result = when {
-                delta < -threshold -> "VISUAL SLOPE: UP"
-                delta > threshold -> "VISUAL SLOPE: DOWN"
-                else -> "VISUAL SLOPE: UNCLEAR"
+            frameHistory.addLast(candles)
+            while (frameHistory.size > 8) frameHistory.removeFirst()
+
+            // Relative visual levels, not actual broker prices.
+            val recent = candles.takeLast(min(8, candles.size))
+            val older = candles.dropLast(min(4, candles.size)).takeLast(4)
+            val last = candles.last()
+            val previous = candles.getOrNull(candles.size - 2)
+            val higherHighs = recent.size >= 4 &&
+                recent.takeLast(2).all { it.top < recent.take(recent.size - 2).minOf { c -> c.top } }
+            val lowerLows = recent.size >= 4 &&
+                recent.takeLast(2).all { it.bottom > recent.take(recent.size - 2).maxOf { c -> c.bottom } }
+
+            val spatial = if (older.isNotEmpty()) {
+                val oldCenter = older.map { it.centerY }.average()
+                val recentCenter = recent.map { it.centerY }.average()
+                when {
+                    recentCenter < oldCenter - ph * 0.025 -> "UP"
+                    recentCenter > oldCenter + ph * 0.025 -> "DOWN"
+                    else -> "FLAT"
+                }
+            } else "FLAT"
+
+            var temporal = "WARMING UP"
+            if (frameHistory.size >= 4) {
+                val prevFrame = frameHistory.elementAt(frameHistory.size - 4)
+                val prevCenter = prevFrame.takeLast(min(5, prevFrame.size)).map { it.centerY }.average()
+                val currentCenter = candles.takeLast(min(5, candles.size)).map { it.centerY }.average()
+                temporal = when {
+                    currentCenter < prevCenter - ph * 0.008 -> "UP"
+                    currentCenter > prevCenter + ph * 0.008 -> "DOWN"
+                    else -> "FLAT"
+                }
             }
-            val coverage = (samples.size * 100 / (pw / 2).coerceAtLeast(1)).coerceIn(0, 100)
-            return "$result\nChart pixels detected: $coverage%\nLive frame sampling • in-memory only\nNot a future-price prediction"
+
+            val candleBias = when {
+                last.greenPixels > last.redPixels * 1.15 -> "GREEN"
+                last.redPixels > last.greenPixels * 1.15 -> "RED"
+                else -> "MIXED"
+            }
+            val direction = when {
+                temporal == "WARMING UP" -> "UNCLEAR"
+                spatial == temporal && spatial != "FLAT" -> spatial
+                temporal == "FLAT" && spatial != "FLAT" -> spatial
+                else -> "UNCLEAR"
+            }
+            val pattern = when {
+                higherHighs -> "higher-high structure"
+                lowerLows -> "lower-low structure"
+                else -> "mixed structure"
+            }
+            val lastMove = if (previous == null) "n/a" else {
+                val d = last.centerY - previous.centerY
+                when {
+                    d < -ph * 0.01 -> "upward visual shift"
+                    d > ph * 0.01 -> "downward visual shift"
+                    else -> "small visual shift"
+                }
+            }
+            return "LIVE VISUAL: $direction\nSpatial trend: $spatial • frame motion: $temporal\nLatest candle pixels: $candleBias • $lastMove\nStructure: $pattern\nApprox. clusters: ${candles.size}\nVisual estimate only; not a price/expiry prediction"
         } finally {
             bmp.recycle()
         }
+    }
+
+    private fun mergeColumns(group: List<VisualCandle>): VisualCandle {
+        val total = group.sumOf { max(1, it.greenPixels + it.redPixels) }
+        val weightedY = group.sumOf { it.centerY * max(1, it.greenPixels + it.redPixels) } / total
+        return VisualCandle(
+            x = group.map { it.x }.average().toInt(),
+            top = group.minOf { it.top },
+            bottom = group.maxOf { it.bottom },
+            centerY = weightedY,
+            greenPixels = group.sumOf { it.greenPixels },
+            redPixels = group.sumOf { it.redPixels }
+        )
     }
 
     private fun isMarketColor(c: Int): Boolean {
