@@ -30,7 +30,13 @@ jobs:
           gradle-version: "8.9"
 
       - name: Build debug APK
-        run: gradle assembleDebug
+        run: |
+  echo "=== Gradle projects ==="
+  gradle projects
+  echo "=== Available tasks ==="
+  gradle tasks --all
+  echo "=== Build APK ==="
+  gradle :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
