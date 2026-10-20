@@ -32,6 +32,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.util.ArrayDeque
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -44,11 +45,19 @@ class CaptureOverlayService : Service() {
         private const val CHANNEL = "tradefloat_capture"
         private const val NOTIFICATION_ID = 17
         private const val PREFS = "tradefloat_roi"
+
+        private const val DEFAULT_LEFT = 0.055f
+        private const val DEFAULT_RIGHT = 0.70f
+        private const val DEFAULT_TOP = 0.14f
+        private const val DEFAULT_BOTTOM = 0.68f
+
+        private const val FRAME_INTERVAL_MS = 800L
     }
 
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    private var projectionCallback: MediaProjection.Callback? = null
 
     private var windowManager: WindowManager? = null
     private var panel: View? = null
@@ -57,7 +66,6 @@ class CaptureOverlayService : Service() {
 
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
-    private var projectionCallback: MediaProjection.Callback? = null
 
     @Volatile
     private var processing = false
@@ -66,33 +74,33 @@ class CaptureOverlayService : Service() {
     private var stopped = false
 
     @Volatile
-    private var roiLeft = 0.055f
+    private var roiLeft = DEFAULT_LEFT
 
     @Volatile
-    private var roiRight = 0.70f
+    private var roiRight = DEFAULT_RIGHT
 
     @Volatile
-    private var roiTop = 0.14f
+    private var roiTop = DEFAULT_TOP
 
     @Volatile
-    private var roiBottom = 0.68f
+    private var roiBottom = DEFAULT_BOTTOM
 
     private var lastFrameAt = 0L
 
-    private data class CandleRun(
+    private data class ColorRun(
         val x: Int,
         val top: Int,
         val bottom: Int,
-        val color: Int
+        val colorType: Int
     )
 
-    private data class CandleCandidate(
+    private data class VisualCandidate(
         val x: Int,
         val left: Int,
         val right: Int,
         val top: Int,
         val bottom: Int,
-        val color: Int
+        val colorType: Int
     ) {
         val centerY: Double
             get() = (top + bottom) / 2.0
@@ -110,7 +118,10 @@ class CaptureOverlayService : Service() {
         flags: Int,
         startId: Int
     ): Int {
-        if (projection != null) return START_NOT_STICKY
+
+        if (projection != null) {
+            return START_NOT_STICKY
+        }
 
         createNotificationChannel()
 
@@ -124,7 +135,10 @@ class CaptureOverlayService : Service() {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                 )
             } else {
-                startForeground(NOTIFICATION_ID, notification)
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification
+                )
             }
         } catch (_: Exception) {
             stopSelf()
@@ -147,13 +161,17 @@ class CaptureOverlayService : Service() {
                 intent?.getParcelableExtra(EXTRA_RESULT_DATA)
             }
 
-        if (resultCode != Activity.RESULT_OK || resultData == null) {
+        if (
+            resultCode != Activity.RESULT_OK ||
+            resultData == null
+        ) {
             stopSelf()
             return START_NOT_STICKY
         }
 
         try {
             loadCalibration()
+            startWorker()
 
             val manager =
                 getSystemService(Context.MEDIA_PROJECTION_SERVICE)
@@ -162,24 +180,28 @@ class CaptureOverlayService : Service() {
             projection = manager.getMediaProjection(
                 resultCode,
                 resultData
+            ) ?: throw IllegalStateException(
+                "Android did not provide screen capture."
             )
 
             if (Settings.canDrawOverlays(this)) {
                 showOverlay()
-                setStatus("LIVE • starting chart reader…")
+                setStatus("LIVE • starting screen reader…")
             }
 
-            startWorker()
             setupCapture()
 
         } catch (e: Exception) {
-            if (panel == null && Settings.canDrawOverlays(this)) {
+            if (
+                panel == null &&
+                Settings.canDrawOverlays(this)
+            ) {
                 showOverlay()
             }
 
             setStatus(
                 "STARTUP ERROR: ${e.javaClass.simpleName}\n" +
-                    (e.message ?: "Check permissions and restart.")
+                    (e.message ?: "Restart the capture session.")
             )
         }
 
@@ -200,16 +222,20 @@ class CaptureOverlayService : Service() {
     private fun buildNotification(): Notification {
         return if (Build.VERSION.SDK_INT >= 26) {
             Notification.Builder(this, CHANNEL)
-                .setContentTitle("TradeFloat screen session")
-                .setContentText("Live visual analysis is running.")
+                .setContentTitle("TradeFloat live session")
+                .setContentText(
+                    "Screen frames are analyzed in memory."
+                )
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("TradeFloat screen session")
-                .setContentText("Live visual analysis is running.")
+                .setContentTitle("TradeFloat live session")
+                .setContentText(
+                    "Screen frames are analyzed in memory."
+                )
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build()
@@ -218,6 +244,7 @@ class CaptureOverlayService : Service() {
 
     private fun setupCapture() {
         val metrics = resources.displayMetrics
+
         val width = metrics.widthPixels.coerceAtLeast(1)
         val height = metrics.heightPixels.coerceAtLeast(1)
         val density = metrics.densityDpi.coerceAtLeast(1)
@@ -228,7 +255,7 @@ class CaptureOverlayService : Service() {
             width,
             height,
             PixelFormat.RGBA_8888,
-            2
+            3
         )
 
         imageReader?.setOnImageAvailableListener(
@@ -242,44 +269,47 @@ class CaptureOverlayService : Service() {
                 val now = SystemClock.elapsedRealtime()
 
                 if (
-                    !processing &&
-                    !stopped &&
-                    now - lastFrameAt >= 800L
+                    stopped ||
+                    processing ||
+                    now - lastFrameAt < FRAME_INTERVAL_MS
                 ) {
-                    processing = true
-                    lastFrameAt = now
+                    image.close()
+                    return@setOnImageAvailableListener
+                }
 
-                    val accepted = workerHandler?.post {
-                        try {
+                processing = true
+                lastFrameAt = now
+
+                val accepted = workerHandler?.post {
+                    try {
+                        if (!stopped) {
                             setStatus(analyzeFrame(image))
-                        } catch (e: Exception) {
-                            setStatus(
-                                "LIVE • analysis error: " +
-                                    e.javaClass.simpleName
-                            )
-                        } finally {
-                            try {
-                                image.close()
-                            } catch (_: Exception) {
-                            }
-                            processing = false
                         }
-                    } ?: false
-
-                    if (!accepted) {
-                        image.close()
+                    } catch (e: Exception) {
+                        setStatus(
+                            "LIVE • analysis error\n" +
+                                e.javaClass.simpleName
+                        )
+                    } finally {
+                        try {
+                            image.close()
+                        } catch (_: Exception) {
+                        }
                         processing = false
                     }
-                } else {
+                } ?: false
+
+                if (!accepted) {
                     image.close()
+                    processing = false
                 }
             },
-            null
+            workerHandler
         )
 
         val activeProjection = projection
             ?: throw IllegalStateException(
-                "Screen-capture permission is missing."
+                "Screen-capture permission unavailable."
             )
 
         val callback = object : MediaProjection.Callback() {
@@ -289,7 +319,11 @@ class CaptureOverlayService : Service() {
         }
 
         projectionCallback = callback
-        activeProjection.registerCallback(callback, workerHandler)
+
+        activeProjection.registerCallback(
+            callback,
+            workerHandler
+        )
 
         virtualDisplay = activeProjection.createVirtualDisplay(
             "TradeFloatLive",
@@ -301,29 +335,38 @@ class CaptureOverlayService : Service() {
             null,
             workerHandler
         ) ?: throw IllegalStateException(
-            "Could not create screen display."
+            "Could not create the screen display."
         )
 
         setStatus(
-            "LIVE • collecting chart frames…\n" +
-                "Adjust the chart region if necessary."
+            "LIVE • collecting chart frames\n" +
+                "Adjust the chart boundaries if needed."
         )
     }
 
-    private fun loadCalibration() {
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+    // ---------------------------------------------------------
+    // Persistent chart-region calibration
+    // ---------------------------------------------------------
 
-        roiLeft = prefs.getFloat("left", 0.055f)
-        roiRight = prefs.getFloat("right", 0.70f)
-        roiTop = prefs.getFloat("top", 0.14f)
-        roiBottom = prefs.getFloat("bottom", 0.68f)
+    private fun loadCalibration() {
+        val prefs = getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        )
+
+        roiLeft = prefs.getFloat("left", DEFAULT_LEFT)
+        roiRight = prefs.getFloat("right", DEFAULT_RIGHT)
+        roiTop = prefs.getFloat("top", DEFAULT_TOP)
+        roiBottom = prefs.getFloat("bottom", DEFAULT_BOTTOM)
 
         validateRegion()
     }
 
     private fun saveCalibration() {
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-            .edit()
+        getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        ).edit()
             .putFloat("left", roiLeft)
             .putFloat("right", roiRight)
             .putFloat("top", roiTop)
@@ -332,10 +375,10 @@ class CaptureOverlayService : Service() {
     }
 
     private fun validateRegion() {
-        roiLeft = roiLeft.coerceIn(0f, 0.60f)
-        roiRight = roiRight.coerceIn(0.30f, 1f)
-        roiTop = roiTop.coerceIn(0f, 0.70f)
-        roiBottom = roiBottom.coerceIn(0.30f, 1f)
+        roiLeft = roiLeft.coerceIn(0f, 0.90f)
+        roiRight = roiRight.coerceIn(0.10f, 1f)
+        roiTop = roiTop.coerceIn(0f, 0.90f)
+        roiBottom = roiBottom.coerceIn(0.10f, 1f)
 
         if (roiRight - roiLeft < 0.10f) {
             roiRight = (roiLeft + 0.10f).coerceAtMost(1f)
@@ -348,7 +391,10 @@ class CaptureOverlayService : Service() {
         }
     }
 
-    private fun adjustRegion(key: String, amount: Float) {
+    private fun adjustRegion(
+        key: String,
+        amount: Float
+    ) {
         when (key) {
             "left" -> roiLeft += amount
             "right" -> roiRight += amount
@@ -360,85 +406,85 @@ class CaptureOverlayService : Service() {
         saveCalibration()
         updateRegionLabel()
 
-        // Discard previous trend readings after changing the region.
         synchronized(trendHistory) {
             trendHistory.clear()
         }
 
         setStatus(
             "CHART REGION UPDATED\n" +
-                "Allow new frames to be analyzed."
+                "Waiting for fresh visual samples."
         )
     }
 
     private fun updateRegionLabel() {
         regionText?.post {
             regionText?.text =
-                "L ${(roiLeft * 100).toInt()}%  " +
-                "R ${(roiRight * 100).toInt()}%  " +
-                "T ${(roiTop * 100).toInt()}%  " +
+                "L ${(roiLeft * 100).toInt()}%   " +
+                "R ${(roiRight * 100).toInt()}%   " +
+                "T ${(roiTop * 100).toInt()}%   " +
                 "B ${(roiBottom * 100).toInt()}%"
         }
     }
 
-    
-private fun calibrationRow(
-    label: String,
-    key: String
-): LinearLayout {
-    val row = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(0, 2, 0, 2)
-    }
+    private fun calibrationRow(
+        label: String,
+        key: String
+    ): LinearLayout {
 
-    val name = TextView(this).apply {
-        text = label
-        textSize = 13f
-        setTextColor(Color.WHITE)
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(4, 0, 4, 0)
-    }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 1, 0, 1)
+        }
 
-    fun makeButton(
-        caption: String,
-        adjustment: Float
-    ): Button {
-        return Button(this).apply {
-            text = caption
-            textSize = 18f
-            minWidth = 0
-            minimumWidth = 0
-            minHeight = 0
-            minimumHeight = 0
-            setPadding(0, 0, 0, 0)
+        val name = TextView(this).apply {
+            text = label
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(4, 0, 4, 0)
+        }
 
-            setOnClickListener {
-                adjustRegion(key, adjustment)
+        fun makeButton(
+            caption: String,
+            amount: Float
+        ): Button {
+            return Button(this).apply {
+                text = caption
+                textSize = 18f
+                minWidth = 0
+                minimumWidth = 0
+                minHeight = 0
+                minimumHeight = 0
+                setPadding(0, 0, 0, 0)
+
+                setOnClickListener {
+                    adjustRegion(key, amount)
+                }
             }
         }
+
+        row.addView(
+            name,
+            LinearLayout.LayoutParams(0, 44, 1f)
+        )
+
+        row.addView(
+            makeButton("−", -0.02f),
+            LinearLayout.LayoutParams(56, 44)
+        )
+
+        row.addView(
+            makeButton("+", 0.02f),
+            LinearLayout.LayoutParams(56, 44)
+        )
+
+        return row
     }
 
-    val minus = makeButton("−", -0.02f)
-    val plus = makeButton("+", 0.02f)
-
-    row.addView(
-        name,
-        LinearLayout.LayoutParams(0, 48, 1f)
-    )
-
-    row.addView(
-        minus,
-        LinearLayout.LayoutParams(64, 48)
-    )
-
-    row.addView(
-        plus,
-        LinearLayout.LayoutParams(64, 48)
-    )
-
-    return row
-}
+    // ---------------------------------------------------------
+    // Frame analysis
+    // ---------------------------------------------------------
 
     private fun analyzeFrame(image: Image): String {
         val bitmap = imageToSmallBitmap(image)
@@ -464,29 +510,38 @@ private fun calibrationRow(
             val plotHeight = bottom - top
 
             if (plotWidth < 30 || plotHeight < 30) {
-                return "LIVE • chart area too small"
+                return "LIVE • chart region too small"
             }
 
-            val runs = mutableListOf<CandleRun>()
-            var coloredPixels = 0
+            val runs = mutableListOf<ColorRun>()
+
+            var coloredSamples = 0
             var sampledPixels = 0
             var x = left
 
             while (x < right) {
                 var y = top
+
                 var runStart = -1
                 var runEnd = -1
                 var runRed = 0
                 var runGreen = 0
 
                 fun finishRun() {
-                    if (runStart >= 0 && runEnd - runStart >= 2) {
-                        val color =
-                            if (runGreen > runRed) Color.GREEN
-                            else Color.RED
+                    if (
+                        runStart >= 0 &&
+                        runEnd - runStart >= 2
+                    ) {
+                        val type =
+                            if (runGreen > runRed) 1 else -1
 
                         runs.add(
-                            CandleRun(x, runStart, runEnd, color)
+                            ColorRun(
+                                x = x,
+                                top = runStart,
+                                bottom = runEnd,
+                                colorType = type
+                            )
                         )
                     }
 
@@ -500,17 +555,19 @@ private fun calibrationRow(
                     val color = bitmap.getPixel(x, y)
                     sampledPixels++
 
-                    if (isCandleColor(color)) {
-                        coloredPixels++
+                    val type = candleColorType(color)
 
-                        if (runStart < 0) runStart = y
+                    if (type != 0) {
+                        coloredSamples++
+
+                        if (runStart < 0) {
+                            runStart = y
+                        }
+
                         runEnd = y
 
-                        val red = Color.red(color)
-                        val green = Color.green(color)
-
-                        if (red > green * 1.18) runRed++
-                        if (green > red * 1.08) runGreen++
+                        if (type < 0) runRed++
+                        if (type > 0) runGreen++
                     } else {
                         finishRun()
                     }
@@ -523,18 +580,18 @@ private fun calibrationRow(
             }
 
             val coverage = (
-                coloredPixels * 100 /
+                coloredSamples * 100 /
                     sampledPixels.coerceAtLeast(1)
             ).coerceIn(0, 100)
 
-            val usableRuns = runs.filter {
-                val runHeight = it.bottom - it.top + 1
-                runHeight >= 2 &&
-                    runHeight <= plotHeight * 0.35
-            }
+            val candidates = groupVisualRuns(
+                runs.filter {
+                    val runHeight =
+                        it.bottom - it.top + 1
 
-            val candidates = groupCandleRuns(
-                usableRuns,
+                    runHeight >= 3 &&
+                        runHeight <= plotHeight * 0.35
+                },
                 plotHeight
             )
 
@@ -543,20 +600,24 @@ private fun calibrationRow(
                     trendHistory.clear()
                 }
 
-                return "LIVE • insufficient candidates\n" +
+                return "LIVE • insufficient visual candidates\n" +
                     "Candidates: ${candidates.size}\n" +
-                    "Coverage: $coverage%\n" +
-                    "Adjust chart region if needed."
+                    "Color coverage: $coverage%\n" +
+                    "Check the selected chart region."
             }
 
             val broadSlope = calculateSlope(candidates)
 
-            val recentStart = (candidates.size * 0.65)
-                .toInt()
-                .coerceAtMost(candidates.lastIndex)
+            val recentStart = (
+                candidates.size * 0.65
+            ).toInt().coerceAtMost(candidates.lastIndex)
 
-            val recentCandidates = candidates.drop(recentStart)
-            val recentSlope = calculateSlope(recentCandidates)
+            val recentCandidates =
+                candidates.drop(recentStart)
+
+            val recentSlope = calculateSlope(
+                recentCandidates
+            )
 
             val broadTrend = classifySlope(
                 broadSlope,
@@ -625,19 +686,100 @@ private fun calibrationRow(
         }
     }
 
+    // ---------------------------------------------------------
+    // Visual candidates: NOT verified candlesticks or OHLC data
+    // ---------------------------------------------------------
+
+    private fun groupVisualRuns(
+        runs: List<ColorRun>,
+        plotHeight: Int
+    ): List<VisualCandidate> {
+
+        val sorted = runs.sortedWith(
+            compareBy<ColorRun> { it.x }
+                .thenBy { it.top }
+        )
+
+        val groups = mutableListOf<VisualCandidate>()
+
+        for (run in sorted) {
+            val previous = groups.lastOrNull()
+
+            val verticalGap =
+                if (previous == null) {
+                    Int.MAX_VALUE
+                } else {
+                    when {
+                        run.top > previous.bottom ->
+                            run.top - previous.bottom
+
+                        previous.top > run.bottom ->
+                            previous.top - run.bottom
+
+                        else -> 0
+                    }
+                }
+
+            val canMerge =
+                previous != null &&
+                    previous.colorType == run.colorType &&
+                    run.x - previous.right <= 8 &&
+                    verticalGap <= max(4, plotHeight / 70)
+
+            if (canMerge && previous != null) {
+                val newLeft = previous.left
+                val newRight = max(previous.right, run.x)
+                val newTop = min(previous.top, run.top)
+                val newBottom = max(previous.bottom, run.bottom)
+
+                groups[groups.lastIndex] = VisualCandidate(
+                    x = (newLeft + newRight) / 2,
+                    left = newLeft,
+                    right = newRight,
+                    top = newTop,
+                    bottom = newBottom,
+                    colorType = previous.colorType
+                )
+            } else {
+                groups.add(
+                    VisualCandidate(
+                        x = run.x,
+                        left = run.x,
+                        right = run.x,
+                        top = run.top,
+                        bottom = run.bottom,
+                        colorType = run.colorType
+                    )
+                )
+            }
+        }
+
+        return groups.filter {
+            it.height >= 3 &&
+                it.height <= plotHeight * 0.45 &&
+                it.right - it.left <= 20
+        }.sortedBy { it.x }
+    }
+
     private fun calculateSlope(
-        points: List<CandleCandidate>
+        points: List<VisualCandidate>
     ): Double {
         if (points.size < 2) return 0.0
 
-        val meanX = points.map { it.x.toDouble() }.average()
-        val meanY = points.map { it.centerY }.average()
+        val meanX = points.map {
+            it.x.toDouble()
+        }.average()
+
+        val meanY = points.map {
+            it.centerY
+        }.average()
 
         var numerator = 0.0
         var denominator = 0.0
 
         for (point in points) {
             val dx = point.x - meanX
+
             numerator += dx * (point.centerY - meanY)
             denominator += dx * dx
         }
@@ -656,7 +798,8 @@ private fun calibrationRow(
         fraction: Double
     ): String {
         val threshold =
-            plotHeight * fraction / plotWidth.coerceAtLeast(1)
+            plotHeight * fraction /
+                plotWidth.coerceAtLeast(1)
 
         return when {
             slope < -threshold -> "UP"
@@ -665,76 +808,7 @@ private fun calibrationRow(
         }
     }
 
-    private fun groupCandleRuns(
-        runs: List<CandleRun>,
-        plotHeight: Int
-    ): List<CandleCandidate> {
-        val sorted = runs.sortedWith(
-            compareBy<CandleRun> { it.x }
-                .thenBy { it.top }
-        )
-
-        val groups = mutableListOf<CandleCandidate>()
-
-        for (run in sorted) {
-            val previous = groups.lastOrNull()
-
-            val verticalGap = if (previous == null) {
-                Int.MAX_VALUE
-            } else {
-                when {
-                    run.top > previous.bottom ->
-                        run.top - previous.bottom
-
-                    previous.top > run.bottom ->
-                        previous.top - run.bottom
-
-                    else -> 0
-                }
-            }
-
-            val canMerge =
-                previous != null &&
-                    previous.color == run.color &&
-                    run.x - previous.right <= 8 &&
-                    verticalGap <= max(4, plotHeight / 70)
-
-            if (canMerge && previous != null) {
-                val newLeft = previous.left
-                val newRight = max(previous.right, run.x)
-                val newTop = min(previous.top, run.top)
-                val newBottom = max(previous.bottom, run.bottom)
-
-                groups[groups.lastIndex] = CandleCandidate(
-                    x = (newLeft + newRight) / 2,
-                    left = newLeft,
-                    right = newRight,
-                    top = newTop,
-                    bottom = newBottom,
-                    color = previous.color
-                )
-            } else {
-                groups.add(
-                    CandleCandidate(
-                        x = run.x,
-                        left = run.x,
-                        right = run.x,
-                        top = run.top,
-                        bottom = run.bottom,
-                        color = run.color
-                    )
-                )
-            }
-        }
-
-        return groups.filter {
-            it.height >= 3 &&
-                it.height <= plotHeight * 0.45 &&
-                it.right - it.left <= 20
-        }.sortedBy { it.x }
-    }
-
-    private fun isCandleColor(color: Int): Boolean {
+    private fun candleColorType(color: Int): Int {
         val red = Color.red(color)
         val green = Color.green(color)
         val blue = Color.blue(color)
@@ -742,7 +816,9 @@ private fun calibrationRow(
         val high = max(red, max(green, blue))
         val low = min(red, min(green, blue))
 
-        if (high < 90 || high - low < 45) return false
+        if (high < 90 || high - low < 45) {
+            return 0
+        }
 
         val redLike =
             red > green * 1.22 &&
@@ -752,19 +828,36 @@ private fun calibrationRow(
             green > red * 1.10 &&
                 green > blue * 1.05
 
-        return redLike || greenLike
+        return when {
+            greenLike -> 1
+            redLike -> -1
+            else -> 0
+        }
     }
 
-    private fun imageToSmallBitmap(image: Image): Bitmap? {
-        val plane = image.planes.firstOrNull() ?: return null
+    // ---------------------------------------------------------
+    // Bitmap conversion: processed in memory, no screenshot file
+    // ---------------------------------------------------------
+
+    private fun imageToSmallBitmap(
+        image: Image
+    ): Bitmap? {
+
+        val plane = image.planes.firstOrNull()
+            ?: return null
 
         val buffer = plane.buffer
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
+
         val width = image.width
         val height = image.height
 
-        if (pixelStride < 4 || width < 1 || height < 1) {
+        if (
+            pixelStride < 4 ||
+            width < 1 ||
+            height < 1
+        ) {
             return null
         }
 
@@ -781,31 +874,38 @@ private fun calibrationRow(
             Bitmap.Config.ARGB_8888
         )
 
-        buffer.rewind()
-        padded.copyPixelsFromBuffer(buffer)
-
-        val cropped = if (paddedWidth != width) {
-            Bitmap.createBitmap(
-                padded,
-                0,
-                0,
-                width,
-                height
-            ).also {
-                padded.recycle()
-            }
-        } else {
-            padded
+        try {
+            buffer.rewind()
+            padded.copyPixelsFromBuffer(buffer)
+        } catch (e: Exception) {
+            padded.recycle()
+            throw e
         }
 
-        val maxDimension = 360
+        val cropped =
+            if (paddedWidth != width) {
+                Bitmap.createBitmap(
+                    padded,
+                    0,
+                    0,
+                    width,
+                    height
+                ).also {
+                    padded.recycle()
+                }
+            } else {
+                padded
+            }
+
+        val maxDimension = 480
 
         if (max(width, height) <= maxDimension) {
             return cropped
         }
 
         val scale =
-            maxDimension.toFloat() / max(width, height)
+            maxDimension.toFloat() /
+                max(width, height)
 
         val scaled = Bitmap.createScaledBitmap(
             cropped,
@@ -814,13 +914,22 @@ private fun calibrationRow(
             false
         )
 
-        if (scaled !== cropped) cropped.recycle()
+        if (scaled !== cropped) {
+            cropped.recycle()
+        }
 
         return scaled
     }
 
+    // ---------------------------------------------------------
+    // Floating panel
+    // ---------------------------------------------------------
+
     private fun showOverlay() {
-        if (panel != null || !Settings.canDrawOverlays(this)) {
+        if (
+            panel != null ||
+            !Settings.canDrawOverlays(this)
+        ) {
             return
         }
 
@@ -830,7 +939,9 @@ private fun calibrationRow(
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(8, 6, 8, 6)
-            setBackgroundColor(Color.rgb(20, 25, 33))
+            setBackgroundColor(
+                Color.rgb(20, 25, 33)
+            )
         }
 
         val header = TextView(this).apply {
@@ -862,7 +973,9 @@ private fun calibrationRow(
 
         val stopButton = Button(this).apply {
             text = "STOP LIVE SESSION"
-            setOnClickListener { stopSelf() }
+            setOnClickListener {
+                stopSelf()
+            }
         }
 
         root.addView(header)
@@ -924,7 +1037,10 @@ private fun calibrationRow(
                                 (event.rawY - touchY).toInt()
 
                             try {
-                                windowManager?.updateViewLayout(root, params)
+                                windowManager?.updateViewLayout(
+                                    root,
+                                    params
+                                )
                             } catch (_: Exception) {
                             }
 
@@ -958,7 +1074,7 @@ private fun calibrationRow(
         if (Build.VERSION.SDK_INT >= 26) {
             val channel = NotificationChannel(
                 CHANNEL,
-                "TradeFloat screen session",
+                "TradeFloat live session",
                 NotificationManager.IMPORTANCE_LOW
             )
 
@@ -973,7 +1089,10 @@ private fun calibrationRow(
         stopped = true
 
         try {
-            imageReader?.setOnImageAvailableListener(null, null)
+            imageReader?.setOnImageAvailableListener(
+                null,
+                null
+            )
         } catch (_: Exception) {
         }
 
@@ -1004,7 +1123,9 @@ private fun calibrationRow(
         projection = null
 
         try {
-            panel?.let { windowManager?.removeView(it) }
+            panel?.let {
+                windowManager?.removeView(it)
+            }
         } catch (_: Exception) {
         }
 
