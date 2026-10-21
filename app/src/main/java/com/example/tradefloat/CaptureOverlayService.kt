@@ -1,23 +1,34 @@
 package com.example.tradefloat
 
-import android.app.*
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Intent
-import android.graphics.PixelFormat
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.*
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.graphics.Bitmap
+import java.nio.ByteBuffer
+import kotlin.math.max
+import kotlin.math.min
 
 class CaptureOverlayService : Service() {
 
@@ -34,19 +45,30 @@ class CaptureOverlayService : Service() {
     private var display: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var wm: WindowManager? = null
+
     private var panel: LinearLayout? = null
     private var status: TextView? = null
     private var details: TextView? = null
+
     private var workerThread: HandlerThread? = null
     private var worker: Handler? = null
-    private var horizonSeconds = 30
+
+    @Volatile
     private var frameBusy = false
+
+    @Volatile
+    private var stopped = false
+
+    private var horizonSeconds = 30
+    private var lastUiUpdate = 0L
 
     private val detector = CandleDetector()
 
     override fun onCreate() {
         super.onCreate()
+
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
+
         createNotificationChannel()
 
         workerThread = HandlerThread("TradeFloatAnalyzer").apply {
@@ -61,12 +83,18 @@ class CaptureOverlayService : Service() {
         startId: Int
     ): Int {
         if (intent?.action != ACTION_START) {
-            showPanel("Panel ready", "Waiting for screen-capture permission")
+            showPanel(
+                "TradeFloat ready",
+                "Start screen capture from the app"
+            )
             return START_NOT_STICKY
         }
 
         if (!Settings.canDrawOverlays(this)) {
-            showPanel("Permission required", "Allow Display over other apps")
+            showPanel(
+                "Overlay permission required",
+                "Allow Display over other apps in Android Settings"
+            )
             return START_NOT_STICKY
         }
 
@@ -76,55 +104,63 @@ class CaptureOverlayService : Service() {
         )
 
         @Suppress("DEPRECATION")
-        val data: Intent? =
-            if (Build.VERSION.SDK_INT >= 33) {
-                intent.getParcelableExtra(
-                    EXTRA_RESULT_DATA,
-                    Intent::class.java
-                )
-            } else {
-                intent.getParcelableExtra(EXTRA_RESULT_DATA)
-            }
+        val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(
+                EXTRA_RESULT_DATA,
+                Intent::class.java
+            )
+        } else {
+            intent.getParcelableExtra(EXTRA_RESULT_DATA)
+        }
 
         if (resultCode != Activity.RESULT_OK || data == null) {
-            showPanel("Capture permission missing", "Return to TradeFloat and start capture")
+            showPanel(
+                "Capture permission missing",
+                "Return to the app and grant screen capture"
+            )
             return START_NOT_STICKY
         }
 
         if (projection != null) return START_NOT_STICKY
 
-        startForeground(NOTIFICATION_ID, buildNotification())
-        showPanel("Starting…", "Connecting to screen capture")
+        stopped = false
+        showPanel("Starting…", "Preparing screen capture")
 
         try {
+            startForeground(NOTIFICATION_ID, buildNotification())
+
             val manager = getSystemService(
                 MEDIA_PROJECTION_SERVICE
             ) as MediaProjectionManager
 
             projection = manager.getMediaProjection(resultCode, data)
+                ?: throw IllegalStateException("MediaProjection unavailable")
 
             val metrics = resources.displayMetrics
-            val width = metrics.widthPixels.coerceAtMost(720)
-            val height = (
-                width.toFloat() * metrics.heightPixels /
-                    metrics.widthPixels
-            ).toInt().coerceAtLeast(1)
+
+            // Lower capture resolution to reduce memory use.
+            val width = min(metrics.widthPixels, 480)
+            val height = max(
+                1,
+                (width.toFloat() * metrics.heightPixels /
+                    metrics.widthPixels).toInt()
+            )
 
             reader = ImageReader.newInstance(
-                width, height, PixelFormat.RGBA_8888, 2
+                width,
+                height,
+                PixelFormat.RGBA_8888,
+                2
             )
 
             projection?.registerCallback(
                 object : MediaProjection.Callback() {
                     override fun onStop() {
-                        display?.release()
-                        display = null
-                        reader?.close()
-                        reader = null
-                        projection = null
+                        stopped = true
+                        releaseDisplayAndReader()
                         updatePanel(
                             "Capture stopped",
-                            "Restart screen capture from the app"
+                            "Start capture again from TradeFloat"
                         )
                     }
                 },
@@ -140,33 +176,66 @@ class CaptureOverlayService : Service() {
                 reader?.surface,
                 null,
                 worker
-            )
+            ) ?: throw IllegalStateException("Virtual display creation failed")
 
             reader?.setOnImageAvailableListener({ source ->
-                if (frameBusy) {
-                    source.acquireLatestImage()?.close()
+                if (stopped || frameBusy) {
+                    try {
+                        source.acquireLatestImage()?.close()
+                    } catch (_: Exception) {
+                    }
                     return@setOnImageAvailableListener
                 }
 
-                val image = source.acquireLatestImage()
-                    ?: return@setOnImageAvailableListener
+                val image = try {
+                    source.acquireLatestImage()
+                } catch (_: Exception) {
+                    null
+                } ?: return@setOnImageAvailableListener
 
                 frameBusy = true
+
                 worker?.post {
                     try {
                         analyze(image)
                     } catch (e: Exception) {
-                        updatePanel("UNCLEAR", e.message ?: "Frame analysis failed")
+                        updatePanel(
+                            "Analysis error",
+                            e.message ?: e.javaClass.simpleName
+                        )
                     } finally {
-                        image.close()
+                        try {
+                            image.close()
+                        } catch (_: Exception) {
+                        }
                         frameBusy = false
                     }
+                } ?: run {
+                    image.close()
+                    frameBusy = false
                 }
             }, worker)
 
-            updatePanel("UNCLEAR", "Capture active · analyzing visible chart")
+            updatePanel(
+                "UNCLEAR",
+                "Capture active · checking visible chart"
+            )
         } catch (e: Exception) {
-            updatePanel("Startup failed", e.message ?: "Check permissions and manifest")
+            stopped = true
+            releaseDisplayAndReader()
+
+            try {
+                projection?.stop()
+            } catch (_: Exception) {
+            }
+
+            projection = null
+
+            updatePanel(
+                "Startup failed",
+                e.message ?: e.javaClass.simpleName
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
         }
 
         return START_NOT_STICKY
@@ -206,24 +275,23 @@ class CaptureOverlayService : Service() {
             gravity = Gravity.CENTER
         }
 
-        row.addView(button("30 SEC") {
+        row.addView(makeButton("30 SEC") {
             horizonSeconds = 30
-            updatePanel("UNCLEAR", "30-second window selected; collecting frames")
+            updatePanel("UNCLEAR", "30-second window selected")
         })
 
-        row.addView(button("1 MIN") {
+        row.addView(makeButton("1 MIN") {
             horizonSeconds = 60
-            updatePanel("UNCLEAR", "60-second window selected; collecting frames")
+            updatePanel("UNCLEAR", "60-second window selected")
         })
 
-        row.addView(button("STOP") {
-            stopCapture()
+        row.addView(makeButton("STOP") {
             stopSelf()
         })
 
         root.addView(row)
 
-        val type = if (Build.VERSION.SDK_INT >= 26) {
+        val windowType = if (Build.VERSION.SDK_INT >= 26) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             @Suppress("DEPRECATION")
@@ -233,7 +301,7 @@ class CaptureOverlayService : Service() {
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
+            windowType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
@@ -249,17 +317,22 @@ class CaptureOverlayService : Service() {
         } catch (e: Exception) {
             status = null
             details = null
-            stopSelf()
+            updatePanel(
+                "Panel failed",
+                e.message ?: "Check overlay permission"
+            )
         }
     }
 
-    private fun button(label: String, action: () -> Unit) =
-        Button(this).apply {
-            text = label
-            textSize = 10f
-            isAllCaps = false
-            setOnClickListener { action() }
-        }
+    private fun makeButton(
+        label: String,
+        action: () -> Unit
+    ): Button = Button(this).apply {
+        text = label
+        textSize = 10f
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
 
     private fun updatePanel(title: String, message: String) {
         Handler(mainLooper).post {
@@ -269,73 +342,129 @@ class CaptureOverlayService : Service() {
     }
 
     private fun analyze(image: Image) {
-        val plane = image.planes.firstOrNull() ?: return
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        if (pixelStride <= 0 || rowStride <= 0) return
+        if (stopped) return
 
-        val paddedWidth = rowStride / pixelStride
-        val padded = Bitmap.createBitmap(
-            paddedWidth,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
+        val bitmap = imageToBitmap(image)
+            ?: throw IllegalStateException("Could not read screen pixels")
 
         try {
-            plane.buffer.rewind()
-            padded.copyPixelsFromBuffer(plane.buffer)
+            val left = (bitmap.width * 0.05f).toInt()
+                .coerceIn(0, bitmap.width - 1)
+            val right = (bitmap.width * 0.70f).toInt()
+                .coerceIn(left + 1, bitmap.width)
+            val top = (bitmap.height * 0.20f).toInt()
+                .coerceIn(0, bitmap.height - 1)
+            val bottom = (bitmap.height * 0.68f).toInt()
+                .coerceIn(top + 1, bitmap.height)
 
-            val full = Bitmap.createBitmap(
-                padded, 0, 0, image.width, image.height
+            val chart = Bitmap.createBitmap(
+                bitmap,
+                left,
+                top,
+                right - left,
+                bottom - top
             )
 
             try {
-                val left = (full.width * 0.05f).toInt()
-                val right = (full.width * 0.70f).toInt()
-                val top = (full.height * 0.20f).toInt()
-                val bottom = (full.height * 0.68f).toInt()
+                val result = detector.detect(chart)
 
-                if (right <= left || bottom <= top) return
+                val message = when {
+                    !result.usable ->
+                        "${result.message} · ${horizonSeconds}s"
 
-                val chart = Bitmap.createBitmap(
-                    full, left, top, right - left, bottom - top
-                )
-
-                try {
-                    val found = detector.detect(chart)
-
-                    val message = if (
-                        !found.usable || found.candles.size < 4
-                    ) {
-                        "Chart not detected clearly · ${horizonSeconds}s"
-                    } else {
-                        "${found.candles.size} candle-like shapes · visual estimate only"
-                    }
-
-                    // Detection alone is not enough to predict future prices.
-                    updatePanel("UNCLEAR", message)
-                } finally {
-                    chart.recycle()
+                    else ->
+                        "${result.candles.size} candidate shapes · OHLC unverified"
                 }
+
+                // A detected shape count is not a forecast.
+                updatePanel("UNCLEAR", message)
             } finally {
-                full.recycle()
+                chart.recycle()
             }
         } finally {
-            padded.recycle()
+            bitmap.recycle()
         }
     }
 
-    private fun stopCapture() {
+    private fun imageToBitmap(image: Image): Bitmap? {
+        val plane = image.planes.firstOrNull() ?: return null
+        val source: ByteBuffer = plane.buffer.duplicate()
+
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+
+        if (pixelStride < 4 || rowStride <= 0) return null
+
+        val sample = 2
+        val outWidth = (image.width + sample - 1) / sample
+        val outHeight = (image.height + sample - 1) / sample
+        val outputPixels = IntArray(outWidth * outHeight)
+
+        val basePosition = source.position()
+        val limit = source.limit()
+
+        var outIndex = 0
+
+        for (y in 0 until image.height step sample) {
+            val rowOffset = basePosition + y * rowStride
+
+            for (x in 0 until image.width step sample) {
+                val index = rowOffset + x * pixelStride
+
+                if (index < 0 || index + 3 >= limit) {
+                    outputPixels[outIndex++] = Color.BLACK
+                    continue
+                }
+
+                val r = source.get(index).toInt() and 0xFF
+                val g = source.get(index + 1).toInt() and 0xFF
+                val b = source.get(index + 2).toInt() and 0xFF
+                val a = source.get(index + 3).toInt() and 0xFF
+
+                outputPixels[outIndex++] =
+                    (a shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+
+        return Bitmap.createBitmap(
+            outputPixels,
+            0,
+            outWidth,
+            outWidth,
+            outHeight,
+            Bitmap.Config.ARGB_8888
+        )
+    }
+
+    private fun releaseDisplayAndReader() {
         try {
             reader?.setOnImageAvailableListener(null, null)
+        } catch (_: Exception) {
+        }
+
+        try {
             display?.release()
+        } catch (_: Exception) {
+        }
+
+        try {
             reader?.close()
-            projection?.stop()
         } catch (_: Exception) {
         }
 
         display = null
         reader = null
+    }
+
+    private fun stopCapture() {
+        stopped = true
+        releaseDisplayAndReader()
+
+        try {
+            projection?.stop()
+        } catch (_: Exception) {
+        }
+
         projection = null
 
         panel?.let {
@@ -357,6 +486,7 @@ class CaptureOverlayService : Service() {
                 "TradeFloat capture",
                 NotificationManager.IMPORTANCE_LOW
             )
+
             getSystemService(NotificationManager::class.java)
                 .createNotificationChannel(channel)
         }
@@ -381,9 +511,13 @@ class CaptureOverlayService : Service() {
 
     override fun onDestroy() {
         stopCapture()
+
         workerThread?.quitSafely()
+        workerThread = null
+        worker = null
+
         super.onDestroy()
     }
 
-    override fun onBind(intent: Intent?) = null
+    override fun onBind(intent: Intent?): IBinder? = null
 }
