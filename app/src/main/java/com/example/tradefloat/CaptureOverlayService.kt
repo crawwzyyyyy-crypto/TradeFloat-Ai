@@ -1,9 +1,9 @@
 package com.example.tradefloat
 
 import android.app.*
-import android.content.Context
 import android.content.Intent
-import android.graphics.*
+import android.graphics.PixelFormat
+import android.graphics.Color
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -17,10 +17,6 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import java.util.ArrayDeque
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
 
 class CaptureOverlayService : Service() {
 
@@ -31,51 +27,31 @@ class CaptureOverlayService : Service() {
 
         private const val CHANNEL_ID = "tradefloat_capture"
         private const val NOTIFICATION_ID = 301
-        private const val FRAME_INTERVAL_MS = 900L
-
-        private const val ROI_LEFT = 0.05f
-        private const val ROI_RIGHT = 0.70f
-        private const val ROI_TOP = 0.20f
-        private const val ROI_BOTTOM = 0.68f
     }
 
     private var projection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-    private var windowManager: WindowManager? = null
-    private var overlay: LinearLayout? = null
-    private var resultText: TextView? = null
-    private var detailText: TextView? = null
-
+    private var display: VirtualDisplay? = null
+    private var reader: ImageReader? = null
+    private var wm: WindowManager? = null
+    private var panel: LinearLayout? = null
+    private var status: TextView? = null
+    private var details: TextView? = null
     private var workerThread: HandlerThread? = null
     private var worker: Handler? = null
-    private var frameWidth = 0
-    private var frameHeight = 0
     private var horizonSeconds = 30
+    private var frameBusy = false
 
-    @Volatile
-    private var processingFrame = false
-
-    private data class Sample(
-        val timeMs: Long,
-        val y: Float
-    )
-
-    private val samples = ArrayDeque<Sample>()
     private val detector = CandleDetector()
-
-    private val projectionCallback = object : MediaProjection.Callback() {
-        override fun onStop() {
-            stopCapture()
-            stopSelf()
-        }
-    }
 
     override fun onCreate() {
         super.onCreate()
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
-        startWorker()
+
+        workerThread = HandlerThread("TradeFloatAnalyzer").apply {
+            start()
+            worker = Handler(looper)
+        }
     }
 
     override fun onStartCommand(
@@ -83,335 +59,301 @@ class CaptureOverlayService : Service() {
         flags: Int,
         startId: Int
     ): Int {
-        if (intent?.action == ACTION_START) {
-            val resultCode = intent.getIntExtra(
-                EXTRA_RESULT_CODE,
-                Activity.RESULT_CANCELED
+        if (intent?.action != ACTION_START) {
+            showPanel("Panel ready", "Waiting for screen-capture permission")
+            return START_NOT_STICKY
+        }
+
+        if (!Settings.canDrawOverlays(this)) {
+            showPanel("Permission required", "Allow Display over other apps")
+            return START_NOT_STICKY
+        }
+
+        val resultCode = intent.getIntExtra(
+            EXTRA_RESULT_CODE,
+            Activity.RESULT_CANCELED
+        )
+
+        @Suppress("DEPRECATION")
+        val data: Intent? =
+            if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(
+                    EXTRA_RESULT_DATA,
+                    Intent::class.java
+                )
+            } else {
+                intent.getParcelableExtra(EXTRA_RESULT_DATA)
+            }
+
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            showPanel("Capture permission missing", "Return to TradeFloat and start capture")
+            return START_NOT_STICKY
+        }
+
+        if (projection != null) return START_NOT_STICKY
+
+        startForeground(NOTIFICATION_ID, buildNotification())
+        showPanel("Starting…", "Connecting to screen capture")
+
+        try {
+            val manager = getSystemService(
+                MEDIA_PROJECTION_SERVICE
+            ) as MediaProjectionManager
+
+            projection = manager.getMediaProjection(resultCode, data)
+
+            val metrics = resources.displayMetrics
+            val width = metrics.widthPixels.coerceAtMost(720)
+            val height = (
+                width.toFloat() * metrics.heightPixels /
+                    metrics.widthPixels
+            ).toInt().coerceAtLeast(1)
+
+            reader = ImageReader.newInstance(
+                width, height, PixelFormat.RGBA_8888, 2
             )
 
-            @Suppress("DEPRECATION")
-            val resultData =
-                if (Build.VERSION.SDK_INT >= 33) {
-                    intent.getParcelableExtra(
-                        EXTRA_RESULT_DATA,
-                        Intent::class.java
-                    )
-                } else {
-                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+            projection?.registerCallback(
+                object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        display?.release()
+                        display = null
+                        reader?.close()
+                        reader = null
+                        projection = null
+                        updatePanel(
+                            "Capture stopped",
+                            "Restart screen capture from the app"
+                        )
+                    }
+                },
+                Handler(mainLooper)
+            )
+
+            display = projection?.createVirtualDisplay(
+                "TradeFloatScreen",
+                width,
+                height,
+                metrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader?.surface,
+                null,
+                worker
+            )
+
+            reader?.setOnImageAvailableListener({ source ->
+                if (frameBusy) {
+                    source.acquireLatestImage()?.close()
+                    return@setOnImageAvailableListener
                 }
 
-            if (resultCode == Activity.RESULT_OK && resultData != null) {
-                startForeground(NOTIFICATION_ID, buildNotification())
-                startCapture(resultCode, resultData)
-            } else {
-                stopSelf()
-            }
+                val image = source.acquireLatestImage()
+                    ?: return@setOnImageAvailableListener
+
+                frameBusy = true
+                worker?.post {
+                    try {
+                        analyze(image)
+                    } catch (e: Exception) {
+                        updatePanel("UNCLEAR", e.message ?: "Frame analysis failed")
+                    } finally {
+                        image.close()
+                        frameBusy = false
+                    }
+                }
+            }, worker)
+
+            updatePanel("UNCLEAR", "Capture active · analyzing visible chart")
+        } catch (e: Exception) {
+            updatePanel("Startup failed", e.message ?: "Check permissions and manifest")
         }
 
         return START_NOT_STICKY
     }
 
-    private fun startWorker() {
-        workerThread = HandlerThread("TradeFloatAnalyzer").apply {
-            start()
-            worker = Handler(looper)
-        }
-    }
-
-    private fun startCapture(resultCode: Int, data: Intent) {
-        if (projection != null) return
-
-        if (!Settings.canDrawOverlays(this)) {
-            stopSelf()
+    private fun showPanel(title: String, message: String) {
+        if (panel != null) {
+            updatePanel(title, message)
             return
         }
-
-        val manager = getSystemService(
-            MEDIA_PROJECTION_SERVICE
-        ) as MediaProjectionManager
-
-        projection = manager.getMediaProjection(resultCode, data)
-        val metrics = resources.displayMetrics
-
-        frameWidth = min(metrics.widthPixels, 720)
-        frameHeight = (
-            frameWidth.toFloat() *
-                metrics.heightPixels / metrics.widthPixels
-            ).toInt().coerceAtLeast(1)
-
-        imageReader = ImageReader.newInstance(
-            frameWidth,
-            frameHeight,
-            PixelFormat.RGBA_8888,
-            2
-        )
-
-        projection?.registerCallback(projectionCallback, Handler(mainLooper))
-
-        virtualDisplay = projection?.createVirtualDisplay(
-            "TradeFloatScreen",
-            frameWidth,
-            frameHeight,
-            metrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface,
-            null,
-            worker
-        )
-
-        imageReader?.setOnImageAvailableListener({ reader ->
-            if (processingFrame) {
-                reader.acquireLatestImage()?.close()
-                return@setOnImageAvailableListener
-            }
-
-            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-            processingFrame = true
-
-            worker?.post {
-                try {
-                    analyzeImage(image)
-                } catch (_: Exception) {
-                    showResult(
-                        "UNCLEAR",
-                        "Unable to analyze this frame"
-                    )
-                } finally {
-                    image.close()
-                    processingFrame = false
-                }
-            }
-        }, worker)
-
-        showOverlay()
-    }
-
-    private fun analyzeImage(image: Image) {
-        val fullBitmap = imageToBitmap(image) ?: run {
-            showResult("UNCLEAR", "Screen frame unavailable")
-            return
-        }
-
-        try {
-            val left = (fullBitmap.width * ROI_LEFT)
-                .toInt().coerceIn(0, fullBitmap.width - 1)
-            val right = (fullBitmap.width * ROI_RIGHT)
-                .toInt().coerceIn(left + 1, fullBitmap.width)
-            val top = (fullBitmap.height * ROI_TOP)
-                .toInt().coerceIn(0, fullBitmap.height - 1)
-            val bottom = (fullBitmap.height * ROI_BOTTOM)
-                .toInt().coerceIn(top + 1, fullBitmap.height)
-
-            val chart = Bitmap.createBitmap(
-                fullBitmap,
-                left,
-                top,
-                right - left,
-                bottom - top
-            )
-
-            try {
-                val detection = detector.detect(chart)
-
-                if (!detection.usable || detection.candles.size < 4) {
-                    showResult(
-                        "UNCLEAR",
-                        "Not enough clear candle shapes"
-                    )
-                    return
-                }
-
-                // Use the most recent visible candle positions as a
-                // visual proxy. These are not actual market OHLC values.
-                val recent = detection.candles
-                    .sortedBy { it.centerX }
-                    .takeLast(3)
-
-                val yValues = recent.map { it.centerY.toFloat() }.sorted()
-                val medianY = yValues[yValues.size / 2]
-                val normalizedY = medianY / chart.height.toFloat()
-
-                val now = SystemClock.elapsedRealtime()
-                synchronized(samples) {
-                    samples.addLast(Sample(now, normalizedY))
-
-                    val cutoff = now - horizonSeconds * 1000L
-                    while (
-                        samples.isNotEmpty() &&
-                        samples.peekFirst().timeMs < cutoff
-                    ) {
-                        samples.removeFirst()
-                    }
-                }
-
-                val result = classifyTrend(now)
-
-                showResult(
-                    result,
-                    "Horizon: ${horizonSeconds}s · " +
-                        "${detection.candles.size} candle-like shapes · " +
-                        "visual trend only"
-                )
-            } finally {
-                chart.recycle()
-            }
-        } finally {
-            fullBitmap.recycle()
-        }
-    }
-
-    private fun classifyTrend(now: Long): String {
-        val snapshot = synchronized(samples) { samples.toList() }
-
-        if (snapshot.size < 8) return "UNCLEAR"
-
-        val first = snapshot.first()
-        val last = snapshot.last()
-
-        if (now - last.timeMs > 3000L) return "UNCLEAR"
-        if (last.timeMs - first.timeMs < 6000L) return "UNCLEAR"
-
-        val change = last.y - first.y
-
-        // Screen coordinates increase downwards:
-        // a lower y-position can correspond to visually higher prices.
-        return when {
-            change < -0.012f -> "VISUAL UP ↑"
-            change > 0.012f -> "VISUAL DOWN ↓"
-            else -> "UNCLEAR"
-        }
-    }
-
-    private fun imageToBitmap(image: Image): Bitmap? {
-        val plane = image.planes.firstOrNull() ?: return null
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-
-        if (pixelStride <= 0 || rowStride <= 0) return null
-
-        val paddedWidth = rowStride / pixelStride
-        val paddedBitmap = Bitmap.createBitmap(
-            paddedWidth,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
-
-        buffer.rewind()
-        paddedBitmap.copyPixelsFromBuffer(buffer)
-
-        val result = Bitmap.createBitmap(
-            paddedBitmap,
-            0,
-            0,
-            image.width,
-            image.height
-        )
-
-        paddedBitmap.recycle()
-        return result
-    }
-
-    private fun showOverlay() {
-        if (overlay != null) return
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(14, 12, 14, 12)
-            setBackgroundColor(Color.rgb(24, 26, 32))
+            setPadding(14, 10, 14, 10)
+            setBackgroundColor(Color.rgb(25, 27, 34))
         }
 
-        resultText = TextView(this).apply {
-            text = "UNCLEAR"
-            textSize = 18f
+        status = TextView(this).apply {
+            text = title
+            textSize = 17f
+            gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
         }
 
-        detailText = TextView(this).apply {
-            text = "Waiting for chart frames…"
+        details = TextView(this).apply {
+            text = message
             textSize = 11f
-            setTextColor(Color.LTGRAY)
             gravity = Gravity.CENTER
+            setTextColor(Color.LTGRAY)
         }
 
-        root.addView(resultText)
-        root.addView(detailText)
+        root.addView(status)
+        root.addView(details)
 
-        val buttons = LinearLayout(this).apply {
+        val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
 
-        buttons.addView(makeButton("30 SEC") {
+        row.addView(button("30 SEC") {
             horizonSeconds = 30
-            synchronized(samples) { samples.clear() }
-            showResult("UNCLEAR", "30-second window selected; collecting frames")
+            updatePanel("UNCLEAR", "30-second window selected; collecting frames")
         })
 
-        buttons.addView(makeButton("1 MIN") {
+        row.addView(button("1 MIN") {
             horizonSeconds = 60
-            synchronized(samples) { samples.clear() }
-            showResult("UNCLEAR", "60-second window selected; collecting frames")
+            updatePanel("UNCLEAR", "60-second window selected; collecting frames")
         })
 
-        buttons.addView(makeButton("STOP") {
+        row.addView(button("STOP") {
             stopCapture()
             stopSelf()
         })
 
-        root.addView(buttons)
+        root.addView(row)
+
+        val type = if (Build.VERSION.SDK_INT >= 26) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_PHONE,
+            type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 20
-            y = 180
+            x = 16
+            y = 160
         }
 
         try {
-            windowManager?.addView(root, params)
-            overlay = root
-        } catch (_: Exception) {
-            stopCapture()
+            wm?.addView(root, params)
+            panel = root
+        } catch (e: Exception) {
+            status = null
+            details = null
             stopSelf()
         }
     }
 
-    private fun makeButton(
-        label: String,
-        action: () -> Unit
-    ): Button {
-        return Button(this).apply {
+    private fun button(label: String, action: () -> Unit) =
+        Button(this).apply {
             text = label
             textSize = 10f
             isAllCaps = false
             setOnClickListener { action() }
         }
-    }
 
-    private fun showResult(result: String, detail: String) {
+    private fun updatePanel(title: String, message: String) {
         Handler(mainLooper).post {
-            resultText?.text = result
-            detailText?.text = detail
+            status?.text = title
+            details?.text = message
         }
     }
 
+    private fun analyze(image: Image) {
+        val plane = image.planes.firstOrNull() ?: return
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        if (pixelStride <= 0 || rowStride <= 0) return
+
+        val paddedWidth = rowStride / pixelStride
+        val padded = Bitmap.createBitmap(
+            paddedWidth,
+            image.height,
+            Bitmap.Config.ARGB_8888
+        )
+
+        try {
+            plane.buffer.rewind()
+            padded.copyPixelsFromBuffer(plane.buffer)
+
+            val full = Bitmap.createBitmap(
+                padded, 0, 0, image.width, image.height
+            )
+
+            try {
+                val left = (full.width * 0.05f).toInt()
+                val right = (full.width * 0.70f).toInt()
+                val top = (full.height * 0.20f).toInt()
+                val bottom = (full.height * 0.68f).toInt()
+
+                if (right <= left || bottom <= top) return
+
+                val chart = Bitmap.createBitmap(
+                    full, left, top, right - left, bottom - top
+                )
+
+                try {
+                    val found = detector.detect(chart)
+
+                    val message = if (
+                        !found.usable || found.candles.size < 4
+                    ) {
+                        "Chart not detected clearly · ${horizonSeconds}s"
+                    } else {
+                        "${found.candles.size} candle-like shapes · visual estimate only"
+                    }
+
+                    // Detection alone is not enough to predict future prices.
+                    updatePanel("UNCLEAR", message)
+                } finally {
+                    chart.recycle()
+                }
+            } finally {
+                full.recycle()
+            }
+        } finally {
+            padded.recycle()
+        }
+    }
+
+    private fun stopCapture() {
+        try {
+            reader?.setOnImageAvailableListener(null, null)
+            display?.release()
+            reader?.close()
+            projection?.stop()
+        } catch (_: Exception) {
+        }
+
+        display = null
+        reader = null
+        projection = null
+
+        panel?.let {
+            try {
+                wm?.removeView(it)
+            } catch (_: Exception) {
+            }
+        }
+
+        panel = null
+        status = null
+        details = null
+    }
+
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= 26) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "TradeFloat screen analysis",
+                "TradeFloat capture",
                 NotificationManager.IMPORTANCE_LOW
             )
             getSystemService(NotificationManager::class.java)
@@ -420,55 +362,25 @@ class CaptureOverlayService : Service() {
     }
 
     private fun buildNotification(): Notification {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        return if (Build.VERSION.SDK_INT >= 26) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("TradeFloat")
-                .setContentText("Screen analysis is active")
+                .setContentText("Screen analysis active")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
                 .setContentTitle("TradeFloat")
-                .setContentText("Screen analysis is active")
+                .setContentText("Screen analysis active")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .build()
         }
     }
 
-    private fun stopCapture() {
-        try {
-            imageReader?.setOnImageAvailableListener(null, null)
-            virtualDisplay?.release()
-            imageReader?.close()
-            projection?.unregisterCallback(projectionCallback)
-            projection?.stop()
-        } catch (_: Exception) {
-        }
-
-        virtualDisplay = null
-        imageReader = null
-        projection = null
-
-        overlay?.let {
-            try {
-                windowManager?.removeView(it)
-            } catch (_: Exception) {
-            }
-        }
-
-        overlay = null
-        resultText = null
-        detailText = null
-
-        synchronized(samples) { samples.clear() }
-    }
-
     override fun onDestroy() {
         stopCapture()
         workerThread?.quitSafely()
-        workerThread = null
-        worker = null
         super.onDestroy()
     }
 
