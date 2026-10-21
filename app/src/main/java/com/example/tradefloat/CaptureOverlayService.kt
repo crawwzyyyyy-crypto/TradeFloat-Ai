@@ -17,6 +17,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.graphics.Bitmap
 
 class CaptureOverlayService : Service() {
 
