@@ -1,4 +1,3 @@
-
 package com.example.tradefloat
 
 import android.graphics.Bitmap
@@ -7,21 +6,9 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Detects candle-like shapes in a cropped chart image.
- *
- * IMPORTANT:
- * - Input must contain only the plot area, excluding price labels,
- *   buttons, volume bars, and unrelated UI.
- * - Screen pixels cannot establish true market OHLC values.
- * - The resulting values are normalized visual coordinates.
- * - Do not treat these estimates as verified prices or a reliable signal.
- */
 class CandleDetector {
 
-    enum class CandleColor {
-        GREEN, RED, UNKNOWN
-    }
+    enum class CandleColor { GREEN, RED, UNKNOWN }
 
     data class DetectedCandle(
         val centerX: Int,
@@ -46,153 +33,207 @@ class CandleDetector {
         val message: String
     )
 
-    /**
-     * Detect bodies from a chart-only bitmap.
-     *
-     * This uses color and geometry heuristics, not computer-vision
-     * model inference. It can fail on unusual chart themes.
-     */
-    fun detect(bitmap: Bitmap): DetectionResult {
-        val width = bitmap.width
-        val height = bitmap.height
+    private data class Segment(
+        val x: Int,
+        val top: Int,
+        val bottom: Int,
+        val color: CandleColor
+    )
 
-        if (width < 80 || height < 80) {
-            return emptyResult("Chart crop is too small.")
+    fun detect(bitmap: Bitmap): DetectionResult {
+        val originalWidth = bitmap.width
+        val originalHeight = bitmap.height
+
+        if (originalWidth < 60 || originalHeight < 60) {
+            return empty("Chart crop is too small")
         }
 
-        val sampleStep = 1
-        val totalPixels = width * height
-        var coloredPixels = 0
+        // Bound processing cost on high-resolution screenshots.
+        val scale = min(1.0, 320.0 / originalWidth)
+        val width = max(1, (originalWidth * scale).toInt())
+        val height = max(1, (originalHeight * scale).toInt())
 
-        val colorMap = Array(width) { IntArray(height) }
+        val workBitmap =
+            if (width != originalWidth || height != originalHeight) {
+                Bitmap.createScaledBitmap(bitmap, width, height, false)
+            } else {
+                bitmap
+            }
 
-        for (x in 0 until width step sampleStep) {
-            for (y in 0 until height step sampleStep) {
-                val color = classifyColor(bitmap.getPixel(x, y))
-                colorMap[x][y] = color.ordinal
+        try {
+            // One byte per pixel instead of a large 2D IntArray.
+            val map = ByteArray(width * height)
+            var coloredPixels = 0
 
-                if (color != CandleColor.UNKNOWN) {
-                    coloredPixels++
+            val pixels = IntArray(width)
+            for (y in 0 until height) {
+                workBitmap.getPixels(pixels, 0, width, 0, y, width, 1)
+
+                val offset = y * width
+                for (x in 0 until width) {
+                    val type = classify(pixels[x])
+                    map[offset + x] = type.toByte()
+
+                    if (type != 0) coloredPixels++
                 }
             }
-        }
 
-        val coverage =
-            coloredPixels.toDouble() / totalPixels.coerceAtLeast(1)
+            val coverage =
+                coloredPixels.toDouble() / (width * height).coerceAtLeast(1)
 
-        if (coverage < 0.001) {
-            return DetectionResult(
-                emptyList(),
-                coverage,
-                false,
-                "Insufficient colored chart pixels."
-            )
-        }
+            if (coverage < 0.001) {
+                return empty("No clear red/green chart pixels", coverage)
+            }
 
-        val rawBodies = mutableListOf<DetectedCandle>()
+            val segments = ArrayList<Segment>()
 
-        // Find vertically connected colored segments in each column.
-        for (x in 0 until width) {
-            var y = 0
+            // Detect vertically connected colored runs.
+            for (x in 0 until width) {
+                var y = 0
 
-            while (y < height) {
-                val color = CandleColor.values()[colorMap[x][y]]
+                while (y < height) {
+                    val type = map[y * width + x].toInt()
 
-                if (color == CandleColor.UNKNOWN) {
+                    if (type == 0) {
+                        y++
+                        continue
+                    }
+
+                    val top = y
+                    while (
+                        y + 1 < height &&
+                        map[(y + 1) * width + x].toInt() == type
+                    ) {
+                        y++
+                    }
+
+                    val bottom = y
+                    val runHeight = bottom - top + 1
+
+                    if (
+                        runHeight >= 3 &&
+                        runHeight <= max(4, (height * 0.18).toInt())
+                    ) {
+                        segments.add(
+                            Segment(
+                                x = x,
+                                top = top,
+                                bottom = bottom,
+                                color = if (type == 1) {
+                                    CandleColor.GREEN
+                                } else {
+                                    CandleColor.RED
+                                }
+                            )
+                        )
+                    }
                     y++
-                    continue
+                }
+            }
+
+            if (segments.isEmpty()) {
+                return empty("No candle-like segments found", coverage)
+            }
+
+            // Cluster segments that continue across adjacent columns.
+            val groups = ArrayList<MutableList<Segment>>()
+
+            for (segment in segments) {
+                var matched: MutableList<Segment>? = null
+
+                for (group in groups.asReversed()) {
+                    val last = group.last()
+
+                    if (segment.x - last.x > 2) break
+
+                    val sameColor = segment.color == last.color
+                    val verticalGap = when {
+                        segment.top > last.bottom ->
+                            segment.top - last.bottom
+                        last.top > segment.bottom ->
+                            last.top - segment.bottom
+                        else -> 0
+                    }
+
+                    if (sameColor && verticalGap <= max(3, height / 120)) {
+                        matched = group
+                        break
+                    }
                 }
 
-                val start = y
-                var end = y
-                var sameColorCount = 0
-
-                while (
-                    end + 1 < height &&
-                    CandleColor.values()[colorMap[x][end + 1]] == color
-                ) {
-                    end++
-                    sameColorCount++
+                if (matched != null) {
+                    matched.add(segment)
+                } else {
+                    groups.add(mutableListOf(segment))
                 }
+            }
 
-                val segmentHeight = end - start + 1
+            val candidates = groups.mapNotNull { group ->
+                val left = group.minOf { it.x }
+                val right = group.maxOf { it.x }
+                val top = group.minOf { it.top }
+                val bottom = group.maxOf { it.bottom }
 
-                // Exclude tiny fragments and tall UI bars.
+                val bodyWidth = right - left + 1
+                val bodyHeight = bottom - top + 1
+
                 if (
-                    segmentHeight in 3..(height * 0.18).toInt().coerceAtLeast(3)
+                    bodyWidth < 2 ||
+                    bodyWidth > max(12, width / 8) ||
+                    bodyHeight < 3 ||
+                    bodyHeight > height * 0.18
                 ) {
-                    rawBodies.add(
-                        DetectedCandle(
-                            centerX = x,
-                            bodyTop = start,
-                            bodyBottom = end,
-                            wickTop = start,
-                            wickBottom = end,
-                            color = color,
-                            quality = sameColorCount.toDouble() /
-                                segmentHeight.coerceAtLeast(1)
+                    null
+                } else {
+                    DetectedCandle(
+                        centerX = (left + right) / 2,
+                        bodyTop = top,
+                        bodyBottom = bottom,
+                        wickTop = top,
+                        wickBottom = bottom,
+                        color = group.first().color,
+                        quality = min(
+                            1.0,
+                            bodyWidth.toDouble() / 5.0
                         )
                     )
                 }
+            }.sortedBy { it.centerX }
 
-                y = end + 1
+            // Remove overlapping duplicate candidates.
+            val unique = ArrayList<DetectedCandle>()
+            for (candidate in candidates) {
+                val previous = unique.lastOrNull()
+
+                if (
+                    previous == null ||
+                    abs(candidate.centerX - previous.centerX) >= 4
+                ) {
+                    unique.add(candidate)
+                } else if (candidate.quality > previous.quality) {
+                    unique[unique.lastIndex] = candidate
+                }
             }
-        }
 
-        if (rawBodies.isEmpty()) {
+            val usable = unique.size >= 8
+
             return DetectionResult(
-                emptyList(),
-                coverage,
-                false,
-                "No candle-like bodies detected."
+                candles = unique,
+                coloredCoverage = coverage,
+                usable = usable,
+                message = if (usable) {
+                    "Found ${unique.size} candidate shapes; OHLC unverified"
+                } else {
+                    "Insufficient candle-like shapes"
+                }
             )
-        }
-
-        val grouped = mergeAdjacentSegments(
-            rawBodies,
-            width,
-            height
-        )
-
-        val finalCandles = grouped
-            .filter { it.bodyHeight >= 3 }
-            .sortedBy { it.centerX }
-
-        val distinct = mutableListOf<DetectedCandle>()
-
-        for (candle in finalCandles) {
-            val previous = distinct.lastOrNull()
-
-            if (
-                previous == null ||
-                candle.centerX - previous.centerX >= 3
-            ) {
-                distinct.add(candle)
-            } else if (candle.quality > previous.quality) {
-                distinct[distinct.lastIndex] = candle
+        } finally {
+            if (workBitmap !== bitmap) {
+                workBitmap.recycle()
             }
         }
-
-        val usable = distinct.size >= 8
-
-        return DetectionResult(
-            candles = distinct,
-            coloredCoverage = coverage,
-            usable = usable,
-            message = if (usable) {
-                "Detected ${distinct.size} candle-like bodies. OHLC is not verified."
-            } else {
-                "Only ${distinct.size} candidate bodies detected; more chart data needed."
-            }
-        )
     }
 
-    /**
-     * Convert pixel coordinates to normalized visual values.
-     *
-     * This is NOT a conversion to market prices. Screen Y increases
-     * downward, so the vertical coordinate is inverted.
-     */
     fun toVisualSeries(
         detection: DetectionResult,
         chartHeight: Int
@@ -201,104 +242,33 @@ class CandleDetector {
             return emptyList()
         }
 
-        return detection.candles.map { candle ->
-            1.0 - (
-                candle.centerY / chartHeight.toDouble()
-            ).coerceIn(0.0, 1.0)
+        return detection.candles.map {
+            1.0 - (it.centerY / chartHeight).coerceIn(0.0, 1.0)
         }
     }
 
-    private fun mergeAdjacentSegments(
-        segments: List<DetectedCandle>,
-        width: Int,
-        height: Int
-    ): List<DetectedCandle> {
-        val sorted = segments.sortedWith(
-            compareBy<DetectedCandle> { it.centerX }
-                .thenBy { it.bodyTop }
-        )
+    private fun classify(color: Int): Int {
+        val r = Color.red(color)
+        val g = Color.green(color)
+        val b = Color.blue(color)
 
-        val output = mutableListOf<DetectedCandle>()
+        if (max(r, max(g, b)) < 100) return 0
+        if (max(r, max(g, b)) - min(r, min(g, b)) < 45) return 0
 
-        for (segment in sorted) {
-            val previous = output.lastOrNull()
-
-            val canMerge = previous != null &&
-                previous.color == segment.color &&
-                segment.centerX - previous.centerX <= 2 &&
-                verticalGap(previous, segment) <=
-                    max(2, height / 150)
-
-            if (canMerge && previous != null) {
-                val top = min(previous.bodyTop, segment.bodyTop)
-                val bottom = max(previous.bodyBottom, segment.bodyBottom)
-
-                output[output.lastIndex] = DetectedCandle(
-                    centerX = (previous.centerX + segment.centerX) / 2,
-                    bodyTop = top,
-                    bodyBottom = bottom,
-                    wickTop = min(previous.wickTop, segment.wickTop),
-                    wickBottom = max(
-                        previous.wickBottom,
-                        segment.wickBottom
-                    ),
-                    color = previous.color,
-                    quality = (
-                        previous.quality + segment.quality
-                    ) / 2.0
-                )
-            } else {
-                output.add(segment)
-            }
-        }
-
-        return output
-    }
-
-    private fun verticalGap(
-        a: DetectedCandle,
-        b: DetectedCandle
-    ): Int {
         return when {
-            b.bodyTop > a.bodyBottom ->
-                b.bodyTop - a.bodyBottom
-
-            a.bodyTop > b.bodyBottom ->
-                a.bodyTop - b.bodyBottom
-
+            r > g * 1.22 && r > b * 1.12 -> 2
+            g > r * 1.10 && g > b * 1.05 -> 1
             else -> 0
         }
     }
 
-    private fun classifyColor(pixel: Int): CandleColor {
-        val r = Color.red(pixel)
-        val g = Color.green(pixel)
-        val b = Color.blue(pixel)
-
-        val high = max(r, max(g, b))
-        val low = min(r, min(g, b))
-
-        if (high < 100 || high - low < 45) {
-            return CandleColor.UNKNOWN
-        }
-
-        return when {
-            r > g * 1.22 && r > b * 1.12 ->
-                CandleColor.RED
-
-            g > r * 1.10 && g > b * 1.05 ->
-                CandleColor.GREEN
-
-            else ->
-                CandleColor.UNKNOWN
-        }
-    }
-
-    private fun emptyResult(message: String) =
-        DetectionResult(
-            candles = emptyList(),
-            coloredCoverage = 0.0,
-            usable = false,
-            message = message
-        )
+    private fun empty(
+        message: String,
+        coverage: Double = 0.0
+    ) = DetectionResult(
+        candles = emptyList(),
+        coloredCoverage = coverage,
+        usable = false,
+        message = message
+    )
 }
