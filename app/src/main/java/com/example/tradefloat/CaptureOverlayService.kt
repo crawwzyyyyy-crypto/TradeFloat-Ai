@@ -85,6 +85,9 @@ class CaptureOverlayService : Service() {
         if (code != Activity.RESULT_OK || data == null || !endpoint.startsWith("https://")) { stopSelf(); return START_NOT_STICKY }
         if (projection != null) return START_NOT_STICKY
         try {
+            // Show the panel before starting capture so startup failures are visible to the user.
+            createPanel()
+            update("STARTING", "Preparing screen capture…")
             val notification = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
             val built = notification.setContentTitle("TradeFloat AI").setContentText("Cloud chart vision active").setSmallIcon(android.R.drawable.ic_menu_view).build()
             if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, built, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION) else startForeground(NOTIFICATION_ID, built)
@@ -118,12 +121,11 @@ class CaptureOverlayService : Service() {
                     } finally { try { img.close() } catch (_: Exception) {} }
                 } ?: img.close()
             }, worker)
-            createPanel()
             update("READY", "Choose 30 sec or 1 min")
         } catch (e: Exception) {
-            update("UNCLEAR", "Startup failed · ${e.javaClass.simpleName}")
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            // Keep the panel visible rather than silently destroying the service.
+            try { createPanel() } catch (_: Exception) {}
+            update("START FAILED", "${e.javaClass.simpleName}: check permissions and screen-capture approval")
         }
         return START_NOT_STICKY
     }
