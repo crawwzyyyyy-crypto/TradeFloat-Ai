@@ -1,3 +1,4 @@
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -16,13 +17,21 @@ android {
     }
 
     buildTypes {
-        release { isMinifyEnabled = false }
-        debug { isMinifyEnabled = false }
+        debug {
+            isMinifyEnabled = false
+        }
+
+        release {
+            isMinifyEnabled = false
+        }
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 }
