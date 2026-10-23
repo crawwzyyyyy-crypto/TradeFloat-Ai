@@ -1,23 +1,25 @@
-# TradeFloat Android project
+# TradeFloat AI — minimal cloud-vision prototype
 
-Visible-chart-only floating analysis prototype. It does not connect to a broker/API, does not place trades, and cannot reliably recover true OHLC data from arbitrary screenshots. Pixel-derived metrics are visual proxies, not verified market indicators or a reliable trading signal.
+Floating overlay has exactly three controls: **30 sec**, **1 min**, **STOP**.
 
-## Roadmap
-1. Floating panel and start/stop: included.
-2. MediaProjection screen sampling in memory: included.
-3. Adjustable chart region persisted locally: included.
-4. Colored candle-like candidates: heuristic only, not verified OHLC extraction.
-5. EMA/RSI/MACD-like calculations on pixel coordinates: explicitly labeled image proxies, not market indicators.
-6. Conservative visual combination with UNCLEAR state: included.
-7. Adjustable analysis horizon: tracked separately; not a forecast.
-8. Manual prediction logging and outcome labeling: included; reported matches are not a guarantee of future accuracy.
+## What is genuinely AI here?
+The Android app captures up to 8 JPEG screenshots during the selected window, then sends those images to the included Cloudflare Worker. The Worker calls Google's Gemini vision-capable API (`gemini-2.5-flash`) and asks it to return `UP`, `DOWN`, or `UNCLEAR`. This is actual image input to a cloud vision model, not a pixel-colour heuristic.
+
+## Free-only constraints
+- Gemini API currently has a free tier for eligible models/accounts, with rate limits and availability that Google can change. Check current official pricing: https://ai.google.dev/gemini-api/docs/pricing
+- This app does not configure billing or switch to a paid model. If the free quota is unavailable/exhausted, it returns `UNCLEAR` with an error message; it does not fall back to paid use.
+- Cloudflare Workers has a free plan subject to its current limits. Deploying the Worker requires a free Cloudflare account and setting a Gemini API key as a Worker secret.
+- A Gemini API key is still required. Never put it into the APK or commit it to GitHub.
+
+## Setup overview
+1. Create a Gemini API key in Google AI Studio: https://aistudio.google.com/app/apikey
+2. Create a Cloudflare account and install Wrangler or use the Cloudflare dashboard to create a Worker from `cloudflare-worker/worker.js`.
+3. Set the Worker secret named `GEMINI_API_KEY` to your key, deploy the Worker, and copy its HTTPS `workers.dev` URL.
+4. Open the Android project in Android Studio (JDK 17, Android SDK 35), build `app:assembleDebug`, and install the APK.
+5. In TradeFloat, paste the Worker HTTPS URL and tap Save endpoint. Grant overlay permission, then start the screen session and approve Android's capture prompt.
+
+## Honest limitations
+Gemini interprets images; it is not a proven short-horizon trading predictor. It can misunderstand chart types, overlays, colors, candles, or time scales. `UP`/`DOWN` are tentative visual interpretations only, not calibrated probabilities or guarantees. Use demo charts only; do not rely on this for real-money trades. A cloud request sends sampled chart screenshots to Google through your Worker. Avoid exposing account balances, personal information, or sensitive notifications in captured screenshots.
 
 ## Build
-1. Install current Android Studio and its supported JDK.
-2. Open this folder in Android Studio and sync Gradle.
-3. Build > Build APK(s), then install the debug APK.
-4. Open TradeFloat. Grant Display over other apps permission.
-5. Tap Start live screen session and approve Android's screen capture dialog.
-6. Switch to the chart, calibrate the chart region, then use Log estimate and manually label an outcome after the chosen horizon.
-
-Android requires fresh screen-capture consent for each session. Test on demo charts first. The app offers manual assistance only; all trading decisions remain yours.
+Open this folder in Android Studio. Project uses Android Gradle Plugin 8.7.3, Kotlin 2.0.21, JDK 17 and compileSdk 35. No API key is included.
