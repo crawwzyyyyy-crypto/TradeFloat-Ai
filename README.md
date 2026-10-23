@@ -1,25 +1,28 @@
-# TradeFloat AI — minimal cloud-vision prototype
+# TradeFloat AI — Gemini + Cloudflare AI fallback
 
-Floating overlay has exactly three controls: **30 sec**, **1 min**, **STOP**.
+Floating overlay: exactly **30 sec**, **1 min**, **STOP**.
 
-## What is genuinely AI here?
-The Android app captures up to 8 JPEG screenshots during the selected window, then sends those images to the included Cloudflare Worker. The Worker calls Google's Gemini vision-capable API (`gemini-2.5-flash`) and asks it to return `UP`, `DOWN`, or `UNCLEAR`. This is actual image input to a cloud vision model, not a pixel-colour heuristic.
+## AI providers
+- Primary: Gemini vision API (`gemini-2.5-flash`) interprets sequential screenshot images.
+- Fallback: Cloudflare Workers AI vision (`@cf/meta/llama-3.2-11b-vision-instruct`) describes selected frames; a text model compares the descriptions.
+- If both fail or free quotas are exhausted, the app returns `UNCLEAR`.
 
-## Free-only constraints
-- Gemini API currently has a free tier for eligible models/accounts, with rate limits and availability that Google can change. Check current official pricing: https://ai.google.dev/gemini-api/docs/pricing
-- This app does not configure billing or switch to a paid model. If the free quota is unavailable/exhausted, it returns `UNCLEAR` with an error message; it does not fall back to paid use.
-- Cloudflare Workers has a free plan subject to its current limits. Deploying the Worker requires a free Cloudflare account and setting a Gemini API key as a Worker secret.
-- A Gemini API key is still required. Never put it into the APK or commit it to GitHub.
+Official references:
+- Gemini pricing: https://ai.google.dev/gemini-api/docs/pricing
+- Gemini rate limits: https://ai.google.dev/gemini-api/docs/rate-limits
+- Cloudflare Workers AI free allocation: https://developers.cloudflare.com/workers-ai/platform/pricing/
+- Cloudflare vision model: https://developers.cloudflare.com/workers-ai/models/llama-3.2-11b-vision-instruct/
 
-## Setup overview
-1. Create a Gemini API key in Google AI Studio: https://aistudio.google.com/app/apikey
-2. Create a Cloudflare account and install Wrangler or use the Cloudflare dashboard to create a Worker from `cloudflare-worker/worker.js`.
-3. Set the Worker secret named `GEMINI_API_KEY` to your key, deploy the Worker, and copy its HTTPS `workers.dev` URL.
-4. Open the Android project in Android Studio (JDK 17, Android SDK 35), build `app:assembleDebug`, and install the APK.
-5. In TradeFloat, paste the Worker HTTPS URL and tap Save endpoint. Grant overlay permission, then start the screen session and approve Android's capture prompt.
+## Free-only setup
+1. Create a Gemini key at https://aistudio.google.com/app/apikey.
+2. Deploy `cloudflare-worker/worker.js` as a Cloudflare Worker and add a Workers AI binding named `AI` (the included `wrangler.toml` shows the binding).
+3. Add the Gemini key as the Worker secret `GEMINI_API_KEY`. With Wrangler: `npx wrangler secret put GEMINI_API_KEY`.
+4. Deploy the Worker and copy its HTTPS `workers.dev` URL.
+5. Build/install the Android app from Android Studio (JDK 17, Android SDK 35). Save the Worker URL in the app, allow overlay permission, start capture, and approve the Android screen-capture prompt.
 
-## Honest limitations
-Gemini interprets images; it is not a proven short-horizon trading predictor. It can misunderstand chart types, overlays, colors, candles, or time scales. `UP`/`DOWN` are tentative visual interpretations only, not calibrated probabilities or guarantees. Use demo charts only; do not rely on this for real-money trades. A cloud request sends sampled chart screenshots to Google through your Worker. Avoid exposing account balances, personal information, or sensitive notifications in captured screenshots.
+Keep the Google project on the Gemini free tier and do not enable/link paid billing. Keep Cloudflare on the Workers Free plan; its published free allocation is 10,000 Neurons/day, and inference beyond the free allocation fails on Workers Free. Do not upgrade or attach billing if you require free-only use. Free quotas and model availability may change. Some Cloudflare vision models require accepting their license before use.
 
-## Build
-Open this folder in Android Studio. Project uses Android Gradle Plugin 8.7.3, Kotlin 2.0.21, JDK 17 and compileSdk 35. No API key is included.
+## Accuracy and privacy
+This is genuine cloud image understanding, not pixel-color heuristics. It is not a validated short-term market forecasting system. UP/DOWN are tentative visual assessments, not calibrated probabilities or guarantees. Use demo charts only. Captured screenshots are sent to the selected provider through the Worker; keep sensitive account details and notifications out of view.
+
+No API keys are included in the ZIP.
