@@ -7,9 +7,13 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -21,22 +25,28 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Explicitly omit the obsolete SDK package named "tools".
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools,platforms;android-35,build-tools;35.0.0'
+          accept-android-sdk-licenses: true
 
-      - name: Install Android platform and build tools
-        run: |
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Set up Gradle
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug
+      - name: Verify SDK packages
+        run: |
+          sdkmanager --list_installed
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -x "$ANDROID_HOME/platform-tools/adb"
 
-      - name: Upload APK
+      - name: Build debug APK
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Upload debug APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
