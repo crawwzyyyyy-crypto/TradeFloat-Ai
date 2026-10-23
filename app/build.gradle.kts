@@ -22,12 +22,15 @@ steps:
       java-version: '17'
 
   - name: Set up Android SDK
-    uses: android-actions/setup-android@v3
+  uses: android-actions/setup-android@v3
+  with:
+    packages: ''
 
-  - name: Install required SDK packages
-    run: |
-      yes | sdkmanager --licenses || true
-      sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+  - name: Install Android SDK packages
+  run: |
+    SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+    "$SDKMANAGER" --version
+    "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
   - name: Set up Gradle
     uses: gradle/actions/setup-gradle@v4
