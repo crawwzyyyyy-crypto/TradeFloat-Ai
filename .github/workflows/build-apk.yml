@@ -10,6 +10,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,14 +23,17 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Install Android SDK 35
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
 
       - name: Build APK
         run: |
           if [ ! -f ./gradlew ]; then
-            echo "Gradle wrapper gradlew is missing from the repository root."
+            echo "ERROR: gradlew is missing from repository root."
             exit 1
           fi
           chmod +x ./gradlew
