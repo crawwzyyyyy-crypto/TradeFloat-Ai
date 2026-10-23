@@ -11,172 +11,86 @@ import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
-
-    companion object {
-        private const val CAPTURE_REQUEST = 501
-        private const val NOTIFICATION_REQUEST = 700
-    }
-
+    companion object { private const val REQUEST_CAPTURE = 101 }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(24, 28, 24, 28)
-            setBackgroundColor(0xFF101318.toInt())
-        }
-
-        root.addView(TextView(this).apply {
-            text = "TRADEFLOAT"
-            textSize = 28f
             gravity = Gravity.CENTER
-            setTextColor(0xFFFFFFFF.toInt())
-        })
-
+            setPadding(28, 28, 28, 28)
+            setBackgroundColor(0xFF111318.toInt())
+        }
         root.addView(TextView(this).apply {
-            text = "Visible-chart analysis • manual assistance\n\n" +
-                "Screen pixels are not verified market prices. " +
-                "TradeFloat does not place trades or guarantee outcomes. " +
-                "Use demo mode first."
-            textSize = 16f
-            setTextColor(0xFFD4D8E0.toInt())
-            setPadding(0, 18, 0, 20)
+            text = "TRADEFLOAT AI"
+            textSize = 28f; gravity = Gravity.CENTER; setTextColor(0xFFFFFFFF.toInt())
         })
-
+        root.addView(TextView(this).apply {
+            text = "Cloud vision chart reader\n\nThe floating panel has only 30 sec, 1 min and STOP. Set your free Cloudflare Worker URL below once."
+            textSize = 15f; gravity = Gravity.CENTER; setTextColor(0xFFD2D6DF.toInt()); setPadding(0, 20, 0, 18)
+        })
+        val endpoint = EditText(this).apply {
+            hint = "Cloudflare Worker URL (https://…workers.dev)"
+            setSingleLine(true)
+            setText(getSharedPreferences("tradefloat", MODE_PRIVATE).getString("endpoint", ""))
+        }
+        root.addView(endpoint)
         root.addView(Button(this).apply {
-            text = "Enable floating panel permission"
+            text = "Save endpoint"
             setOnClickListener {
-                if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    val settingsIntent = Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
-                    )
-                    startActivity(settingsIntent)
+                val value = endpoint.text.toString().trim()
+                if (!value.startsWith("https://")) {
+                    Toast.makeText(this@MainActivity, "Enter an HTTPS Worker URL", Toast.LENGTH_LONG).show()
+                } else {
+                    getSharedPreferences("tradefloat", MODE_PRIVATE).edit().putString("endpoint", value).apply()
+                    Toast.makeText(this@MainActivity, "Endpoint saved", Toast.LENGTH_SHORT).show()
                 }
             }
         })
-
         root.addView(Button(this).apply {
-            text = "Start live screen session"
+            text = "Enable floating panel"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    startActivity(
-                        Intent(
-                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            Uri.parse("package:$packageName")
-                        )
-                    )
+                    startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                }
+            }
+        })
+        root.addView(Button(this).apply {
+            text = "Start live chart reader"
+            setOnClickListener {
+                if (!Settings.canDrawOverlays(this@MainActivity)) {
+                    startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                     return@setOnClickListener
                 }
-
-                val manager = getSystemService(
-                    Context.MEDIA_PROJECTION_SERVICE
-                ) as MediaProjectionManager
-
-                startActivityForResult(
-                    manager.createScreenCaptureIntent(),
-                    CAPTURE_REQUEST
-                )
+                val url = getSharedPreferences("tradefloat", MODE_PRIVATE).getString("endpoint", "") ?: ""
+                if (!url.startsWith("https://")) {
+                    Toast.makeText(this@MainActivity, "Save the Worker URL first", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                startActivityForResult(mgr.createScreenCaptureIntent(), REQUEST_CAPTURE)
             }
         })
-
-        root.addView(Button(this).apply {
-            text = "Stop live session"
-            setOnClickListener {
-                stopService(
-                    Intent(
-                        this@MainActivity,
-                        CaptureOverlayService::class.java
-                    )
-                )
-            }
-        })
-
-        root.addView(TextView(this).apply {
-            text = "ROADMAP\n\n" +
-                "1. Floating panel\n" +
-                "2. Live screen capture\n" +
-                "3. Chart-region sampling\n" +
-                "4. Heuristic candle detection\n" +
-                "5. Visual indicator experiments\n" +
-                "6. Conservative assessment\n" +
-                "7. Horizon selection\n" +
-                "8. Manual outcome validation\n\n" +
-                "Visual analysis is experimental. " +
-                "No automatic trading."
-            textSize = 14f
-            setTextColor(0xFFB7C0CE.toInt())
-            setPadding(0, 22, 0, 12)
-        })
-
-        setContentView(
-            ScrollView(this).apply {
-                addView(root)
-            }
-        )
-
-        if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(
-                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                NOTIFICATION_REQUEST
-            )
-        }
+        setContentView(root)
+        if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 102)
     }
-
-    @Deprecated("Activity result compatibility")
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: Intent?
-    ) {
+    @Deprecated("Deprecated Android API kept for compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode != CAPTURE_REQUEST) return
-
-        if (resultCode != RESULT_OK || data == null) {
-            return
-        }
-
-        if (!Settings.canDrawOverlays(this)) {
-            return
-        }
-
-        val serviceIntent = Intent(
-            this,
-            CaptureOverlayService::class.java
-        ).apply {
-            // Required by CaptureOverlayService.onStartCommand().
+        if (requestCode != REQUEST_CAPTURE || resultCode != RESULT_OK || data == null) return
+        val endpoint = getSharedPreferences("tradefloat", MODE_PRIVATE).getString("endpoint", "") ?: ""
+        val service = Intent(this, CaptureOverlayService::class.java).apply {
             action = CaptureOverlayService.ACTION_START
-
-            putExtra(
-                CaptureOverlayService.EXTRA_RESULT_CODE,
-                resultCode
-            )
-
-            putExtra(
-                CaptureOverlayService.EXTRA_RESULT_DATA,
-                data
-            )
+            putExtra(CaptureOverlayService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(CaptureOverlayService.EXTRA_RESULT_DATA, data)
+            putExtra(CaptureOverlayService.EXTRA_ENDPOINT, endpoint)
         }
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-        } catch (e: Exception) {
-            android.util.Log.e(
-                "TradeFloat",
-                "Could not start capture service",
-                e
-            )
-        }
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(service) else startService(service)
+        finish()
     }
 }
