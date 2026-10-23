@@ -1,4 +1,3 @@
-
 name: Build TradeFloat APK
 
 on:
@@ -26,12 +25,15 @@ jobs:
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ""
 
       - name: Install SDK packages
         shell: bash
         run: |
-          yes | sdkmanager --licenses || true
+          set -e
+          yes | sdkmanager --licenses
           sdkmanager --install "platform-tools"
           sdkmanager --install "platforms;android-35"
           sdkmanager --install "build-tools;35.0.0"
