@@ -1,46 +1,31 @@
-name: Build TradeFloat APK
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
 
-on:
-push:
-branches: [main, master]
-pull_request:
-branches: [main, master]
-workflow_dispatch:
+android {
+    namespace = "com.example.tradefloat"
+    compileSdk = 35
 
-jobs:
-build:
-runs-on: ubuntu-latest
+    defaultConfig {
+        applicationId = "com.example.tradefloat"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 3
+        versionName = "1.2-ai-fix"
+    }
 
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
+    buildTypes {
+        debug { isMinifyEnabled = false }
+        release { isMinifyEnabled = false }
+    }
 
-  - name: Set up Java 17
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: '17'
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
 
-  - name: Set up Android SDK
-  uses: android-actions/setup-android@v3
-  with:
-    packages: ''
-
-  - name: Install Android SDK packages
-  run: |
-    SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
-    "$SDKMANAGER" --version
-    "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-
-  - name: Set up Gradle
-    uses: gradle/actions/setup-gradle@v4
-
-  - name: Build debug APK
-    run: gradle --no-daemon :app:assembleDebug
-
-  - name: Upload APK
-    uses: actions/upload-artifact@v4
-    with:
-      name: tradefloat-debug-apk
-      path: app/build/outputs/apk/debug/app-debug.apk
-      if-no-files-found: error
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
