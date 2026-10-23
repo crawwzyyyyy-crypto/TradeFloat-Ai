@@ -1,37 +1,46 @@
 
-plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-}
+name: Build TradeFloat APK
 
-android {
-    namespace = "com.example.tradefloat"
-    compileSdk = 35
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
-    defaultConfig {
-        applicationId = "com.example.tradefloat"
-        minSdk = 26
-        targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
-    }
+permissions:
+  contents: read
 
-    buildTypes {
-        debug {
-            isMinifyEnabled = false
-        }
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-        release {
-            isMinifyEnabled = false
-        }
-    }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-}
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --licenses
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradefloat-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
