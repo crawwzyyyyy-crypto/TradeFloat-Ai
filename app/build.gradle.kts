@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.tradefloat.ai"
+    namespace = "com.example.tradefloat"
     compileSdk = 35
 
     defaultConfig {
