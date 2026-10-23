@@ -11,13 +11,17 @@ android {
         applicationId = "com.example.tradefloat"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2-ai-fix"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildTypes {
-        debug { isMinifyEnabled = false }
-        release { isMinifyEnabled = false }
+        debug {
+            isMinifyEnabled = false
+        }
+        release {
+            isMinifyEnabled = false
+        }
     }
 
     compileOptions {
